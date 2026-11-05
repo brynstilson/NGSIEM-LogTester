@@ -39,6 +39,7 @@ On macOS or Linux, use `.venv/bin/python app.py`. Set `PORT` in `.env` to use a 
 | --- | --- |
 | `app.py` | Web routes, and opening and closing forensic records |
 | `workflow.py` | Clone, get credentials, send the log, delete the clone. Timeouts and retries are in `Settings` |
+| `sample_events.py` | The built-in synthetic sample events |
 | `falcon_client.py` | Falcon API calls and the masked verbose log |
 | `forensic_log.py` | The append-only log on disk |
 | `templates/index.html` | The operator page |
@@ -53,23 +54,74 @@ real authentication in front of it before sharing it with other operators.
 
 ## What it does
 
-1. **Lists connectors.** `GET /ngsiem/combined/connections/v1`. Pull connectors are listed but
-   can't be selected, because they have no ingest URL.
+1. **Lists connectors.** `GET /ngsiem/combined/connections/v1`, in PUSH and PULL sections.
 2. **Reads the parser on selection.** `GET /ngsiem/entities/connections/v1`, reading `parser_name`.
-   The result is kept in server memory for step 4.
-3. **Takes a raw JSON log.** One object, or an array of objects to send several events.
+   The result is kept in server memory for step 4. Pull connectors are read again at submit.
+3. **Takes a raw log.** One JSON object, or an array of objects to send several events. Raw mode
+   also accepts plain text, such as a syslog line.
 4. **Clones and sends on submit:**
    - Falcon has no clone call, so a clone is a new connection with the same parser and vendor
-     details: `POST /ngsiem/entities/connections/v1`, named `<source>-clone-<UTC timestamp>`.
+     details: `POST /ngsiem/entities/connections/v1`, named `<source>-clone-<UTC timestamp>`. Falcon
+     keeps only the first 50 characters of a name, so long source names are shortened to fit.
    - `GET /ngsiem/entities/connections/token/v1` returns the token and ingest URL, waiting through
      202 responses while the clone provisions. If it doesn't return a token, the app generates one
      with a `POST` to the same route.
-   - The log is POSTed to the ingest URL with `Authorization: Bearer <token>`.
+   - The app waits 5 seconds, because a new token can briefly be rejected with HTTP 401. Change
+     `ingest_ready_wait_seconds` in `workflow.py` to adjust this.
+   - The log is POSTed to the ingest URL with `Authorization: Bearer <token>`. A rejected send is
+     tried up to six times in total, 5 seconds apart, because some new tokens took longer than
+     15 seconds to become active in live testing.
 5. **Deletes the clone.** `DELETE /ngsiem/entities/connections/v1`, retried up to three times. This
    runs whether or not the log was sent, and passes through the delete limiter below.
 6. **Reports success or failure**, with an expandable log of every step and HTTP exchange.
    Credentials and tokens are masked in that log. A submission counts as failed if its clone
    couldn't be deleted, and the message names the clone to remove by hand.
+
+## Built-in sample events
+
+The "Built-in sample event" dropdown fills the log window with a synthetic event for one of 20 log
+sources. Timestamps are set when you select a sample, so reselect it if it has been sitting a while.
+Every event contains `NGSIEM-LogTester-TEST`, so this finds them in Advanced Event Search:
+
+```
+"NGSIEM-LogTester-TEST"
+```
+
+They use reserved addresses and contain no real people or patient data. The events are in
+`sample_events.py`, and each one is labelled with how far to trust its format:
+
+| Label | Meaning | Sources |
+| --- | --- | --- |
+| Documented | Field names come from the vendor's own reference or example | Proofpoint TAP, AWS CloudTrail, AWS SecurityHub, Cloudflare, Google Workspace, Snowflake |
+| Partly documented | Some field names are confirmed; the rest follow a third-party example or the commonly seen format | Windows, Entra, Cisco Firepower, vSphere, Abnormal Security, Claroty xDome, Fortinet, Okta, Palo Alto NGFW, Palo Alto Prisma |
+| Approximate | No usable reference could be read, so check it against a real log | Cisco UCS, Check Point, Epic, Netskope |
+
+**A sample isn't guaranteed to parse.** It was written from public documentation, not captured from
+a product or checked against CrowdStrike's parsers. A real export may also wrap or batch events.
+
+**Parsers:** Falcon rejects a clone whose parser name it doesn't recognize. In live testing, the
+tenant's connector catalog had no parser for Cisco UCS, Abnormal Security, Netskope or Snowflake, and
+the likely names `cisco-ucs`, `abnormal-security`, `netskope` and `snowflake` were rejected. Those
+samples can only be sent through a connector that uses a parser your tenant has.
+
+**Syslog sources:** Cisco UCS, Cisco Firepower and Epic natively send syslog text, so their samples
+are bare lines. Selecting one switches the send mode to Raw.
+
+## Pull connectors
+
+A pull connector has no ingest URL, so its clone is a push connection built from the generic HEC
+connector in the catalog, using the pull connector's exact parser. The pull connector, its vendor
+credentials and its config aren't touched or copied. The app:
+
+1. Reads the pull connector's current parser and records it as `source_parser_stored`.
+2. Finds the one push connector in the catalog named like HEC or HTTP Event. With none or several,
+   it stops before cloning and lists the candidates.
+3. Creates the clone, then gets its ingest token and URL.
+4. Reads the clone back and confirms its parser matches exactly. If not, nothing is sent.
+5. Sends the log, then deletes the clone through the delete limiter below.
+
+**This tests the parser, not the vendor pull.** A real pull may batch, split or wrap events before
+they reach the parser, so paste the log in the shape the parser would receive it.
 
 ## Delete limiter
 
@@ -105,8 +157,9 @@ submission:
 
 | Event | Contents |
 | --- | --- |
-| `submission_started` | OS user, client address, API client ID, Falcon URL, connector ID, send mode, the full submitted log and its SHA-256 |
-| `clone_created` | Clone ID, name and parser |
+| `submission_started` | OS user, client address, API client ID, Falcon URL, connector ID, send mode, built-in sample ID if unedited, the full submitted log and its SHA-256 |
+| `source_parser_stored` | Pull connectors only: the source connector ID and its parser |
+| `clone_created` | Clone ID, name, parser, source type, and the catalog connector it was built from |
 | `clone_delete_refused` | Clone details and why the delete limiter refused. Followed by `clone_delete_failed` |
 | `clone_deleted` or `clone_delete_failed` | Clone details, and the error if it failed |
 | `submission_finished` | Outcome, message, source connector, clone, and the verbose log |
@@ -137,8 +190,11 @@ submission:
 
 | Mode | Target | Body |
 | --- | --- | --- |
-| HEC event (default) | The ingest URL as returned | `{"event": <your log>}` |
-| Raw | The ingest URL plus `/raw` | Your log, unchanged |
+| HEC event (default) | The ingest URL as returned | `{"event": <your log>}`. JSON only |
+| Raw | The ingest URL plus `/raw` | Your log, unchanged. JSON or plain text |
+
+In Raw mode, anything that isn't a JSON object or array of objects is sent as plain text, including
+JSON with a typo. The page warns you when this will happen, and the verbose log records it.
 
 ## Tests
 

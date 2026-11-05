@@ -15,10 +15,12 @@ from app import create_app
 from falcon_client import ActivityLog, DeleteRefused, FalconClient, FalconError
 from forensic_log import DEFAULT_PATH, ForensicLog
 from mock_falcon import MockFalcon
+from sample_events import SAMPLE_IDS, SAMPLES, render_sample
 from workflow import Settings, build_ingest_url, delete_clone, parse_log, resolve_connector
 
 LOG = '{"event": "login", "user": "alice"}'
 CLIENT_SECRET = "SECRET-CLIENT-VALUE"
+TEXT_SAMPLE_IDS = {sample["id"] for sample in SAMPLES if "text" in sample}
 
 
 @pytest.fixture
@@ -39,7 +41,10 @@ def forensic_path(tmp_path):
 
 
 def fast_settings():
-    return Settings(token_wait_seconds=1, token_poll_seconds=0.01, ingest_retry_seconds=0.01, cleanup_retry_seconds=0.01)
+    return Settings(
+        token_wait_seconds=1, token_poll_seconds=0.01, ingest_attempts=3, ingest_retry_seconds=0.01,
+        ingest_ready_wait_seconds=0.01, cleanup_retry_seconds=0.01,
+    )
 
 
 @pytest.fixture
@@ -64,11 +69,18 @@ def assert_no_secrets(result, mock):
     assert "mock-access-token" not in text
 
 
-def test_lists_every_connector_sorted_and_marks_pull(web):
+def test_lists_every_connector_sorted_with_its_section(web):
     data = web.get("/api/connectors").get_json()
     assert data["success"]
     assert [c["name"] for c in data["connectors"]] == ["App logs", "Okta prod", "S3 access logs"]
-    assert {c["name"]: c["can_ingest"] for c in data["connectors"]}["S3 access logs"] is False
+    assert [c["section"] for c in data["connectors"]] == ["push", "push", "pull"]
+
+
+@pytest.mark.parametrize("source_type,section", [("PULL", "pull"), ("Push", "push"), ("Unknown", "other"), (None, "other")])
+def test_section_handles_any_source_type(web, mock, source_type, section):
+    mock.connections[0]["source_type"] = source_type
+    data = web.get("/api/connectors").get_json()
+    assert {c["id"]: c["section"] for c in data["connectors"]}["conn-okta"] == section
 
 
 def test_lists_across_pages(web, mock):
@@ -131,11 +143,257 @@ def test_invalid_logs_fail_before_cloning(web, mock, bad):
     assert result["log"]
 
 
-def test_pull_connector_is_refused_without_cloning(web, mock):
+def test_pull_connector_gets_a_hec_clone_with_the_same_parser(web, mock):
+    result = submit(web, connector_id="conn-s3")
+    assert result["success"], result
+    created = mock.created[0]
+    assert created["connector_id"] == "cat-hec"
+    assert created["parser"] == "aws-s3"
+    assert created["name"].startswith("S3 access logs-clone-")
+    assert "config_id" not in created
+    assert "config" not in created
+    assert json.loads(mock.ingested[0]["body"]) == {"event": json.loads(LOG)}
+    assert_no_secrets(result, mock)
+
+
+def test_pull_clone_ignores_push_connectors_for_the_same_vendor(web, mock):
+    mock.catalog.append({
+        "id": "cat-s3-push", "name": "S3 Push", "type": "PUSH", "parsers": ["aws-s3"],
+        "vendor_name": "AWS", "vendor_product_name": "S3",
+    })
+    assert submit(web, connector_id="conn-s3")["success"]
+    assert mock.created[0]["connector_id"] == "cat-hec"
+
+
+def test_pull_clone_is_the_only_connector_deleted(web, mock):
+    before = json.dumps([c for c in mock.connections])
+    assert submit(web, connector_id="conn-s3")["success"]
+    assert mock.delete_attempts == ["clone-1"]
+    assert json.dumps(mock.connections) == before
+
+
+@pytest.mark.parametrize("statuses,ingest", [([], [400]), ([500, 500, 500], [])])
+def test_pull_failures_never_delete_anything_but_the_clone(web, mock, statuses, ingest):
+    mock.delete_statuses = statuses
+    mock.ingest_statuses = ingest
+    assert not submit(web, connector_id="conn-s3")["success"]
+    assert set(mock.delete_attempts) == {"clone-1"}
+    assert {"conn-okta", "conn-app", "conn-s3"} <= {c["id"] for c in mock.connections}
+
+
+def test_pull_parser_is_read_again_at_submit(web, mock):
+    web.get("/api/connectors/conn-s3/parser")
+    mock.connections[2]["parser_name"] = "aws-s3-v2"
+    assert submit(web, connector_id="conn-s3")["success"]
+    assert mock.created[0]["parser"] == "aws-s3-v2"
+
+
+def test_pull_without_a_parser_is_refused_before_cloning(web, mock):
+    mock.connections[2]["parser_name"] = None
     result = submit(web, connector_id="conn-s3")
     assert not result["success"]
-    assert "pull" in result["message"]
+    assert "no parser" in result["message"]
     assert mock.created == []
+
+
+def test_pull_clone_with_the_wrong_parser_sends_nothing_and_is_deleted(web, mock):
+    mock.clone_parser_override = "something-else"
+    result = submit(web, connector_id="conn-s3")
+    assert not result["success"]
+    assert "wasn't sent" in result["message"]
+    assert mock.ingested == []
+    assert mock.delete_attempts == ["clone-1"]
+    assert clone_ids(mock) == []
+
+
+@pytest.mark.parametrize("hec_count", [0, 2])
+def test_pull_without_exactly_one_hec_connector_is_refused(web, mock, hec_count):
+    others = [c for c in mock.catalog if c["id"] != "cat-hec"]
+    mock.catalog = others + [
+        {"id": f"hec-{i}", "name": f"HEC variant {i}", "type": "PUSH", "parsers": []} for i in range(hec_count)
+    ]
+    result = submit(web, connector_id="conn-s3")
+    assert not result["success"]
+    assert "generic HEC connector" in result["message"]
+    assert mock.created == []
+
+
+def test_pull_submission_is_fully_logged(web, mock, forensic_path):
+    result = submit(web, connector_id="conn-s3")
+    rows = records(forensic_path)
+    assert [r["event"] for r in rows] == [
+        "submission_started", "source_parser_stored", "clone_created", "clone_deleted", "submission_finished",
+    ]
+    assert {r["submission_id"] for r in rows} == {result["submission_id"]}
+    assert rows[1]["source_connector_id"] == "conn-s3"
+    assert rows[1]["parser"] == "aws-s3"
+    assert rows[2]["clone"]["built_from_connector_id"] == "cat-hec"
+    assert rows[2]["clone"]["source_type"] == "Pull"
+    assert rows[-1]["source_connector"]["section"] == "pull"
+    titles = [entry["title"] for entry in rows[-1]["activity"]]
+    assert any("Confirmed the clone uses parser 'aws-s3'" in title for title in titles)
+    text = forensic_path.read_text(encoding="utf-8")
+    assert mock.TOKEN not in text
+    assert CLIENT_SECRET not in text
+
+
+@pytest.mark.parametrize("connector_id", ["conn-okta", "conn-s3"])
+def test_waits_5_seconds_after_the_token_and_before_the_first_send(client, mock, forensic_path, monkeypatch, connector_id):
+    mock.not_ready_polls = 0
+    sleeps = []
+    monkeypatch.setattr("workflow.time.sleep", lambda seconds: sleeps.append((seconds, list(mock.calls))))
+    web = create_app(client, Settings(), ForensicLog(forensic_path)).test_client()
+
+    result = submit(web, connector_id=connector_id)
+
+    assert result["success"], result
+    assert len(sleeps) == 1
+    seconds, calls_so_far = sleeps[0]
+    assert seconds == 5
+    assert ("GET", "/ngsiem/entities/connections/token/v1") in calls_so_far
+    assert ("POST", "/services/collector") not in calls_so_far
+    assert any("Waiting 5s" in entry["title"] for entry in result["log"])
+
+
+def test_wait_happens_once_and_retries_keep_their_own_delay(client, mock, forensic_path, monkeypatch):
+    mock.not_ready_polls = 0
+    mock.ingest_statuses = [401]
+    sleeps = []
+    monkeypatch.setattr("workflow.time.sleep", sleeps.append)
+    settings = Settings(ingest_ready_wait_seconds=5, ingest_retry_seconds=7)
+    web = create_app(client, settings, ForensicLog(forensic_path)).test_client()
+
+    assert submit(web)["success"]
+    assert sleeps == [5, 7]
+
+
+def test_no_wait_when_the_log_is_never_sent(client, mock, forensic_path, monkeypatch):
+    mock.clone_parser_override = "something-else"
+    mock.not_ready_polls = 0
+    sleeps = []
+    monkeypatch.setattr("workflow.time.sleep", sleeps.append)
+    web = create_app(client, Settings(), ForensicLog(forensic_path)).test_client()
+
+    assert not submit(web, connector_id="conn-s3")["success"]
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("sample_id", sorted(SAMPLE_IDS))
+@pytest.mark.parametrize("connector_id", ["conn-okta", "conn-s3"])
+def test_every_sample_runs_the_full_flow_in_both_modes(web, mock, forensic_path, sample_id, connector_id):
+    text = render_sample(sample_id)
+    event = {"connector_id": connector_id, "log": text, "mode": "event", "sample_id": sample_id}
+    if sample_id in TEXT_SAMPLE_IDS:
+        # Plain text can't go in the HEC envelope, so only Raw mode may clone anything.
+        assert not web.post("/api/submit", json=event).get_json()["success"]
+        assert mock.created == []
+        ingested = []
+    else:
+        assert web.post("/api/submit", json=event).get_json()["success"]
+        assert json.loads(mock.ingested[0]["body"]) == {"event": json.loads(text)}
+        ingested = [mock.ingested[0]]
+
+    raw = {**event, "mode": "raw"}
+    assert web.post("/api/submit", json=raw).get_json()["success"]
+    sent = mock.ingested[len(ingested)]
+    assert sent["path"] == "/services/collector/raw"
+    assert sent["body"] == text
+
+    assert clone_ids(mock) == []
+    started = [r for r in records(forensic_path) if r["event"] == "submission_started"]
+    assert [r["sample_event_id"] for r in started] == [sample_id, sample_id]
+
+
+SYSLOG_LINE = "Nov 05 17:13:02 host %UCSM-3-LINK_DOWN: [F0209] Adapter link down"
+
+
+def test_raw_mode_sends_plain_text_exactly(web, mock):
+    result = submit(web, log=f"  {SYSLOG_LINE}\n", mode="raw")
+    assert result["success"], result
+    assert mock.ingested[0]["body"] == SYSLOG_LINE
+    assert mock.ingested[0]["path"] == "/services/collector/raw"
+    assert mock.ingested[0]["content_type"].startswith("text/plain")
+    assert any("sending it as plain text" in entry["title"] for entry in result["log"])
+    assert clone_ids(mock) == []
+
+
+def test_raw_mode_sends_plain_text_through_a_pull_clone(web, mock):
+    assert submit(web, connector_id="conn-s3", log=SYSLOG_LINE, mode="raw")["success"]
+    assert mock.created[0]["connector_id"] == "cat-hec"
+    assert mock.ingested[0]["body"] == SYSLOG_LINE
+    assert mock.delete_attempts == ["clone-1"]
+
+
+def test_plain_text_is_recorded_in_full_in_the_forensic_log(web, forensic_path):
+    assert submit(web, log=SYSLOG_LINE, mode="raw")["success"]
+    started = records(forensic_path)[0]
+    assert started["submitted_log"] == SYSLOG_LINE
+    assert started["log_sha256"] == hashlib.sha256(SYSLOG_LINE.encode()).hexdigest()
+
+
+def test_event_mode_still_refuses_plain_text_before_cloning(web, mock):
+    result = submit(web, log=SYSLOG_LINE, mode="event")
+    assert not result["success"]
+    assert "Raw mode" in result["message"]
+    assert mock.created == []
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t"])
+def test_raw_mode_refuses_an_empty_log_before_cloning(web, mock, blank):
+    result = submit(web, log=blank, mode="raw")
+    assert not result["success"]
+    assert mock.created == []
+
+
+def test_raw_mode_still_splits_a_json_array_into_lines(web, mock):
+    assert submit(web, log='[{"a": 1}, {"a": 2}]', mode="raw")["success"]
+    assert [json.loads(line) for line in mock.ingested[0]["body"].splitlines()] == [{"a": 1}, {"a": 2}]
+    assert mock.ingested[0]["path"] == "/services/collector/raw"
+
+
+def test_raw_mode_keeps_non_ascii_text(web, mock):
+    line = "Nov 05 host message: café ✓"
+    assert submit(web, log=line, mode="raw")["success"]
+    assert mock.ingested[0]["body"] == line
+
+
+@pytest.mark.parametrize("connector_id", ["conn-okta", "conn-s3"])
+def test_long_source_names_still_clone_and_delete(web, mock, connector_id):
+    source = next(c for c in mock.connections if c["id"] == connector_id)
+    source["name"] = "A very long data connector name that goes well past fifty characters"
+    result = submit(web, connector_id=connector_id)
+    assert result["success"], result
+    assert len(mock.created[0]["name"]) <= 50
+    assert mock.created[0]["name"].startswith("A very long data connector na")
+    assert mock.delete_attempts == ["clone-1"]
+    assert clone_ids(mock) == []
+
+
+def test_new_token_rejected_for_a_while_is_still_retried(client, mock, forensic_path, monkeypatch):
+    mock.not_ready_polls = 0
+    mock.ingest_statuses = [401, 401, 401, 401, 401]
+    monkeypatch.setattr("workflow.time.sleep", lambda seconds: None)
+    web = create_app(client, Settings(), ForensicLog(forensic_path)).test_client()
+    assert submit(web)["success"]
+    assert len(mock.ingested) == 6
+
+
+def test_token_that_never_works_fails_after_all_attempts(client, mock, forensic_path, monkeypatch):
+    mock.not_ready_polls = 0
+    mock.ingest_statuses = [401] * 6
+    monkeypatch.setattr("workflow.time.sleep", lambda seconds: None)
+    web = create_app(client, Settings(), ForensicLog(forensic_path)).test_client()
+    result = submit(web)
+    assert not result["success"]
+    assert "HTTP 401" in result["message"]
+    assert len(mock.ingested) == 6
+    assert clone_ids(mock) == []
+
+
+def test_push_connectors_still_clone_from_their_own_connector(web, mock):
+    assert submit(web)["success"]
+    assert mock.created[0]["connector_id"] == "cat-okta"
+    assert mock.delete_attempts == ["clone-1"]
 
 
 def test_token_read_waits_through_provisioning(web, mock):

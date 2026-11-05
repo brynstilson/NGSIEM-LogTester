@@ -32,6 +32,8 @@
   button:disabled { opacity: .5; cursor: not-allowed; }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .hint { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+  .hint a { color: inherit; }
+  label.below { margin-top: 16px; }
   .invalid { color: var(--bad); }
   dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 16px; margin: 12px 0 0; font-size: 14px; }
   dt { color: var(--muted); }
@@ -66,6 +68,7 @@
       <button id="refresh" type="button">Refresh</button>
     </div>
     <p class="hint" id="connector-hint" hidden></p>
+    <p class="hint" id="pull-note" hidden>Pull connector: your log goes through a temporary HEC connector using this same parser. This tests the parser, not the vendor pull.</p>
     <dl id="details" hidden>
       <dt>Parser</dt><dd class="parser" id="d-parser"></dd>
       <dt>Type</dt><dd id="d-type"></dd>
@@ -75,15 +78,18 @@
   </section>
 
   <section>
-    <label for="log">Raw JSON log</label>
+    <label for="sample">Built-in sample event</label>
+    <select id="sample"><option value="">None: I'll paste my own log</option></select>
+    <p class="hint" id="sample-note" hidden><span id="sample-note-text"></span> <a id="sample-source" target="_blank" rel="noopener noreferrer">Format reference</a></p>
+    <label for="log" class="below">Raw log</label>
     <textarea id="log" spellcheck="false" placeholder='{ "timestamp": "2026-11-01T12:00:00Z", "message": "example" }'></textarea>
-    <p class="hint" id="log-hint">Paste one JSON object, or an array of objects to send several events.</p>
+    <p class="hint" id="log-hint"></p>
     <div class="actions">
       <div>
         <label for="mode">Send as</label>
         <select id="mode">
           <option value="event">HEC event: wrap in {"event": ...}</option>
-          <option value="raw">Raw: send as-is to /raw</option>
+          <option value="raw">Raw: send as-is to /raw (JSON or plain text)</option>
         </select>
       </div>
       <div class="row">
@@ -105,7 +111,9 @@
 <script>
   const $ = (id) => document.getElementById(id);
   const connectorSelect = $("connector"), logInput = $("log"), submitButton = $("submit");
+  const sampleSelect = $("sample");
   let selected = null, busy = false, selectionRequest = 0;
+  let samples = [], loadedSampleText = null, previousSampleId = "", sampleRequest = 0, rawChosenForSample = false;
 
   function parseInput() {
     const text = logInput.value;
@@ -120,13 +128,26 @@
   function refreshControls() {
     const parsed = parseInput();
     const hint = $("log-hint");
-    hint.classList.toggle("invalid", Boolean(parsed.error));
-    hint.textContent = parsed.error
-      ? `Invalid JSON: ${parsed.error}`
-      : "Paste one JSON object, or an array of objects to send several events.";
-    const ready = selected && selected.can_ingest && !parsed.empty && !parsed.error;
+    const raw = $("mode").value === "raw";
+    // Scalars and arrays of non-objects are valid JSON but not events, so the server treats them as text.
+    const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+    const isEvent = isObject(parsed.value)
+      || (Array.isArray(parsed.value) && parsed.value.length > 0 && parsed.value.every(isObject));
+    const plainText = !parsed.empty && !isEvent;
+    hint.classList.toggle("invalid", plainText && !raw);
+    if (plainText && raw) {
+      hint.textContent = "Not a JSON event, so this will be sent exactly as plain text.";
+    } else if (plainText) {
+      hint.textContent = parsed.error
+        ? `Invalid JSON: ${parsed.error}. To send plain text, choose Raw below.`
+        : "This isn't a JSON object. To send plain text, choose Raw below.";
+    } else {
+      hint.textContent = "Paste one JSON object, or an array of objects to send several events. Plain text, such as a syslog line, needs Raw mode.";
+    }
+    const ready = selected && !parsed.empty && (raw || !plainText);
     submitButton.disabled = busy || !ready;
     connectorSelect.disabled = busy || connectorSelect.options.length <= 1;
+    sampleSelect.disabled = busy;
     $("refresh").disabled = busy;
   }
 
@@ -174,6 +195,7 @@
     busy = true;
     selected = null;
     $("details").hidden = true;
+    $("pull-note").hidden = true;
     $("connector-hint").hidden = true;
     connectorSelect.replaceChildren(new Option("Loading connectors...", ""));
     refreshControls();
@@ -187,11 +209,14 @@
     }
     const empty = data.connectors.length === 0;
     connectorSelect.replaceChildren(new Option(empty ? "No data connectors found" : "Select a data connector...", ""));
-    for (const connector of data.connectors) {
-      const suffix = connector.can_ingest ? "" : " (pull: can't receive logs)";
-      const option = new Option(`${connector.name}${suffix}`, connector.id);
-      option.disabled = !connector.can_ingest;
-      connectorSelect.add(option);
+    const sections = [["push", "PUSH connectors"], ["pull", "PULL connectors"], ["other", "Other connectors"]];
+    for (const [section, label] of sections) {
+      const connectors = data.connectors.filter((connector) => connector.section === section);
+      if (connectors.length === 0) continue;
+      const group = document.createElement("optgroup");
+      group.label = label;
+      group.append(...connectors.map((connector) => new Option(connector.name, connector.id)));
+      connectorSelect.append(group);
     }
     refreshControls();
   }
@@ -200,6 +225,7 @@
     const request = ++selectionRequest;
     selected = null;
     $("details").hidden = true;
+    $("pull-note").hidden = true;
     const id = connectorSelect.value;
     const hint = $("connector-hint");
     hint.hidden = !id;
@@ -221,6 +247,61 @@
     $("d-status").textContent = selected.status || "Unknown";
     $("d-vendor").textContent = [selected.vendor_name, selected.vendor_product_name].filter(Boolean).join(" / ") || "Unknown";
     $("details").hidden = false;
+    $("pull-note").hidden = selected.section !== "pull";
+    refreshControls();
+  }
+
+  async function loadSamples() {
+    const data = await callApi("/api/sample-events");
+    if (!data.success) return;
+    samples = data.samples;
+    for (const sample of samples) sampleSelect.add(new Option(sample.label, sample.id));
+  }
+
+  function showSampleNote(sample) {
+    $("sample-note").hidden = !sample;
+    if (!sample) return;
+    const accuracy = {
+      documented: "Format: documented by the vendor.",
+      partial: "Format: partly documented.",
+      approximate: "Format: approximate, so check it against a real log.",
+    }[sample.accuracy];
+    $("sample-note-text").textContent = `${accuracy} ${sample.note}`;
+    $("sample-source").href = sample.source;
+  }
+
+  async function selectSample() {
+    const request = ++sampleRequest;
+    const id = sampleSelect.value;
+    const sample = samples.find((item) => item.id === id);
+    // Anything in the window that isn't an untouched sample is the operator's own work.
+    const hasOwnText = logInput.value.trim() && logInput.value !== loadedSampleText;
+    if (id && hasOwnText && !window.confirm("Replace the log you've entered with this sample event?")) {
+      sampleSelect.value = previousSampleId;
+      return;
+    }
+    previousSampleId = id;
+    showSampleNote(sample);
+    if (!id) {
+      loadedSampleText = null;
+      return;
+    }
+    const data = await callApi(`/api/sample-events/${encodeURIComponent(id)}`);
+    if (request !== sampleRequest) return;
+    if (!data.success) {
+      showResult(false, data.message, []);
+      return;
+    }
+    logInput.value = data.log;
+    loadedSampleText = data.log;
+    // Plain-text samples need Raw mode. A mode the operator chose themselves is left alone otherwise.
+    if (sample.format === "text" && $("mode").value !== "raw") {
+      $("mode").value = "raw";
+      rawChosenForSample = true;
+    } else if (sample.format !== "text" && rawChosenForSample) {
+      $("mode").value = "event";
+      rawChosenForSample = false;
+    }
     refreshControls();
   }
 
@@ -233,7 +314,13 @@
     const data = await callApi("/api/submit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connector_id: selected.id, log: logInput.value, mode: $("mode").value }),
+      body: JSON.stringify({
+        connector_id: selected.id,
+        log: logInput.value,
+        mode: $("mode").value,
+        // Only an unedited sample counts as that sample in the forensic log.
+        sample_id: logInput.value === loadedSampleText ? sampleSelect.value : null,
+      }),
     });
     busy = false;
     submitButton.textContent = label;
@@ -241,6 +328,11 @@
     refreshControls();
   }
 
+  sampleSelect.addEventListener("change", selectSample);
+  $("mode").addEventListener("change", () => {
+    rawChosenForSample = false;
+    refreshControls();
+  });
   connectorSelect.addEventListener("change", selectConnector);
   $("refresh").addEventListener("click", loadConnectors);
   logInput.addEventListener("input", refreshControls);
@@ -250,6 +342,7 @@
     if (parsed.value !== undefined) logInput.value = JSON.stringify(parsed.value, null, 2);
     refreshControls();
   });
+  loadSamples();
   loadConnectors();
 </script>
 </body>
