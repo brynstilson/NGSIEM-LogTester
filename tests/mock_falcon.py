@@ -51,6 +51,8 @@ class MockFalcon:
         self.token_get_non_json = False
         self.rename_clones = False  # Stores clones under a different name than was requested.
         self.hide_clones_on_read = False  # Reading a clone by ID answers 404.
+        self.clone_parser_override = None  # Stores clones with this parser instead of the requested one.
+        self.delete_attempts = []  # Every ID a DELETE call named, whatever its outcome.
         self.ingest_statuses = []  # Consumed per POST; 200 once empty.
         self.ingest_body = {"text": "Success", "code": 0}
         self.page_size_override = None
@@ -107,13 +109,16 @@ class MockFalcon:
             self.created.append(body)
             id_ = f"clone-{len(self.created)}"
             self.connections.append(_connection(
-                id_, f"{body['name']}-renamed" if self.rename_clones else body["name"], body["parser"], "Push",
+                # Falcon keeps only the first 50 characters of a name, without any error.
+                id_, f"{body['name']}-renamed" if self.rename_clones else body["name"][:50],
+                self.clone_parser_override or body["parser"], "Push",
                 body.get("vendor_name", "Generic"), body.get("vendor_product_name", "HEC"),
             ))
             return jsonify(resources=[{"id": id_}]), 201
 
         @app.delete("/ngsiem/entities/connections/v1")
         def delete_connection():
+            self.delete_attempts.append(request.args.get("ids"))
             status = self.delete_statuses.pop(0) if self.delete_statuses else 200
             if status != 200:
                 return jsonify(errors=[{"code": status, "message": "delete rejected"}]), status

@@ -20,7 +20,8 @@ from workflow import Settings
 
 OUTPUT = ROOT / "samples" / "forensic-log-sample.jsonl"
 LOGIN_EVENT = '{"eventType":"user.session.start","actor":{"alternateId":"alice@example.com"},"outcome":{"result":"SUCCESS"}}'
-BAD_EVENT = '{"eventType":"user.session.end","actor":{"alternateId":"bob@example.com"}}'
+S3_EVENT = '{"eventName":"GetObject","bucket":"example-bucket","status":200}'
+BAD_EVENT ='{"eventType":"user.session.end","actor":{"alternateId":"bob@example.com"}}'
 
 
 def main():
@@ -30,14 +31,18 @@ def main():
     server = make_server("127.0.0.1", mock.port, mock.app, threaded=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     client = FalconClient("sample-api-client-id", "sample-client-secret", f"http://127.0.0.1:{mock.port}")
-    settings = Settings(token_poll_seconds=0.2, ingest_retry_seconds=0.2, cleanup_retry_seconds=0.2)
+    settings = Settings(
+        token_poll_seconds=0.2, ingest_retry_seconds=0.2, ingest_ready_wait_seconds=0.2, cleanup_retry_seconds=0.2
+    )
     web = create_app(client, settings, ForensicLog(OUTPUT)).test_client()
 
-    def submit(log):
-        return web.post("/api/submit", json={"connector_id": "conn-okta", "log": log, "mode": "event"}).get_json()
+    def submit(log, connector_id="conn-okta"):
+        return web.post("/api/submit", json={"connector_id": connector_id, "log": log, "mode": "event"}).get_json()
 
     # 1. Everything works.
     print(submit(LOGIN_EVENT)["message"])
+    # 1a. A pull connector is tested through a temporary HEC clone with the same parser.
+    print(submit(S3_EVENT, "conn-s3")["message"])
     # 2. The ingest endpoint rejects the log, and the clone is still cleaned up.
     mock.not_ready_polls = 0
     mock.ingest_statuses = [400]

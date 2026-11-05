@@ -9,7 +9,8 @@ from flask import Flask, jsonify, render_template, request
 
 from falcon_client import ActivityLog, FalconClient, FalconError
 from forensic_log import ForensicLog
-from workflow import MODE_EVENT, MODE_RAW, Settings, is_pull, submit_log
+from sample_events import SAMPLE_IDS, list_samples, render_sample
+from workflow import MODE_EVENT, MODE_RAW, Settings, connector_section, is_pull, submit_log
 
 
 def _summary(connection):
@@ -21,7 +22,7 @@ def _summary(connection):
         "source_type": connection.get("source_type"),
         "vendor_name": connection.get("vendor_name"),
         "vendor_product_name": connection.get("vendor_product_name"),
-        "can_ingest": not is_pull(connection),
+        "section": connector_section(connection),
     }
 
 
@@ -62,6 +63,17 @@ def create_app(client=None, settings=None, forensic=None):
         selected[connection_id] = connection
         return jsonify(success=True, connector=_summary(connection), log=log.entries)
 
+    @app.get("/api/sample-events")
+    def sample_events():
+        return jsonify(success=True, samples=list_samples())
+
+    @app.get("/api/sample-events/<sample_id>")
+    def sample_event(sample_id):
+        text = render_sample(sample_id)
+        if text is None:
+            return jsonify(success=False, message=f"Unknown sample event: {sample_id}"), 404
+        return jsonify(success=True, log=text)
+
     @app.post("/api/submit")
     def submit():
         # Requiring a JSON body means another site can't trigger this without a CORS preflight.
@@ -73,6 +85,8 @@ def create_app(client=None, settings=None, forensic=None):
         mode = data.get("mode", MODE_EVENT)
         text = data.get("log") if isinstance(data.get("log"), str) else ""
         submission_id = str(uuid.uuid4())
+        sample_id = data.get("sample_id")
+        sample_id = sample_id if isinstance(sample_id, str) and sample_id in SAMPLE_IDS else None
 
         # No forensic record means no tenant change, so this write has to succeed first.
         try:
@@ -85,6 +99,7 @@ def create_app(client=None, settings=None, forensic=None):
                 falcon_base_url=client.base_url,
                 connector_id=connection_id,
                 mode=mode,
+                sample_event_id=sample_id,
                 log_sha256=hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest(),
                 submitted_log=text,
             )
@@ -108,7 +123,8 @@ def create_app(client=None, settings=None, forensic=None):
         try:
             if mode not in (MODE_EVENT, MODE_RAW):
                 raise FalconError(f"Unknown send mode: {mode}")
-            if connection is None:
+            # A pull connector is read again here, so its clone gets the parser assigned right now.
+            if connection is None or is_pull(connection):
                 if not connection_id:
                     raise FalconError("Select a data connector first.")
                 connection = selected[connection_id] = client.get_connection(connection_id, log)
