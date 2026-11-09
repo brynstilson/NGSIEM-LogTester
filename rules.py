@@ -8,8 +8,7 @@ import time
 
 from cql import FALSE, TRUE, UNKNOWN, Evaluator, parse_rule, tokenize
 from falcon_client import FalconError
-from field_model import (PREFIX, PROFILES, EventView, example_value, expand_envelopes, profile_for_parser,
-                         profile_for_rule, raw_value_for)
+from field_model import PREFIX, PROFILES, EventView, example_value, profile_for_rule, raw_value_for, text_fields
 from sample_events import MARKER, render_sample
 
 LIKELY, UNCERTAIN, UNLIKELY, NEEDS_EVENTS, NOT_APPLICABLE = (
@@ -162,8 +161,8 @@ def events_of(text, mode):
     return [text.strip()] if mode == "raw" else []
 
 
-def _evaluate_event(rule, event, parser, derived=None):
-    view = EventView(event, parser, derived)
+def _evaluate_event(rule, event, parser):
+    view = EventView(event, parser)
     computed = [name for kind, name in rule.stages if kind == "assign"]
     evaluator = Evaluator(view, computed)
     states = [evaluator.run(node) for kind, node in rule.stages if kind == "filter"]
@@ -188,13 +187,9 @@ def judge(rule_info, events, parser):
     if not events:
         return {**base, "verdict": UNLIKELY, "summary": "There's no event to check.", "conditions": [],
                 "suggestions": [], "matching_events": 0}
-    expanded = [pair for event in events for pair in expand_envelopes(event, parser)]
-    outcomes = [_evaluate_event(rule, event, parser, derived) for event, derived in expanded]
+    outcomes = [_evaluate_event(rule, event, parser) for event in events]
     matching = sum(1 for state, _ in outcomes if state is TRUE)
     unknown = sum(1 for state, _ in outcomes if state is UNKNOWN)
-    if not outcomes:
-        return {**base, "verdict": UNLIKELY, "summary": "The batch array has no events.", "conditions": [],
-                "suggestions": [], "matching_events": 0}
     shown = next((ev for state, ev in outcomes if state is TRUE), None) or outcomes[0][1]
     unsupported = sorted(set(rule.unsupported) | set(shown.unsupported))
     # Tags such as #Vendor come from the parser, so a match on those alone says nothing about the log.
@@ -228,11 +223,6 @@ def judge(rule_info, events, parser):
             suggestions.append(condition.suggestion)
     if rule.threshold > 1 and matching < rule.threshold:
         suggestions.append(f"Send at least {rule.threshold} matching events as a JSON array.")
-    envelopes = (profile_for_parser(parser)[1] or {}).get("envelopes")
-    if envelopes and verdict != LIKELY and all(not derived for _, derived in expanded):
-        names = ", ".join(envelopes)
-        suggestions.append(f"This parser expects events inside a batch array ({names}). "
-                           f'For example: {{"{next(iter(envelopes))}": [ <your event> ]}}.')
     return {**base, "verdict": verdict, "summary": summary, "conditions": conditions,
             "suggestions": suggestions, "matching_events": matching}
 
@@ -316,7 +306,8 @@ def _raw_path(view, name):
         return name[len(PREFIX):], None
     alias = (view.profile or {}).get("aliases", {}).get(name)
     if alias:
-        return alias
+        path, transform = alias
+        return (path[0] if isinstance(path, list) else path), transform
     if name.startswith("#") or name.startswith("@") or "." in name:
         return None, None
     return name, None
@@ -337,7 +328,18 @@ def build_template(rule_info):
         try:
             base = json.loads(rendered)
         except ValueError:
-            base = None  # Text samples can't take structured fields, so start from JSON instead.
+            if PROFILES.get(parser, {}).get("reader"):
+                # XML, CSV and similar text can't be safely rewritten, so say what to change instead.
+                check = judge(rule_info, [rendered], parser)
+                note = ""
+                if check["verdict"] != LIKELY and check["suggestions"]:
+                    note = ("This source sends text, so the sample wasn't changed to fit the rule. To match it: "
+                            + " ".join(check["suggestions"]))
+                return rendered, note
+            base = rendered  # key=value text, which can be edited field by field
+    kv_text = base if isinstance(base, str) else None
+    if kv_text is not None:
+        base = dict(text_fields(kv_text))
     event = base if isinstance(base, dict) else {"message": f"{MARKER} correlation rule test"}
     view = EventView(event, parser)
     unmet = []
@@ -401,15 +403,27 @@ def build_template(rule_info):
     note = ""
     if unmet:
         note = "Edit before sending: " + "; ".join(unmet) + "."
-    log = events[0] if len(events) == 1 else events
-    envelopes = PROFILES.get(parser, {}).get("envelopes")
-    if envelopes:
-        candidates = [{key: events} for key in envelopes]
-        for candidate in candidates:
-            if judge(rule_info, [candidate], parser)["verdict"] == LIKELY:
-                return candidate, note
-        return candidates[0], note
-    return log, note
+    if kv_text is not None:
+        if rule.threshold > 1:
+            note = f"{note} The rule needs {rule.threshold} matching events, so send this line {rule.threshold} times.".strip()
+        return _apply_kv(kv_text, event), note
+    return (events[0] if len(events) == 1 else events), note
+
+
+def _apply_kv(text, fields):
+    """Write changed key=value pairs back into a syslog line, keeping everything else as it was."""
+    original = text_fields(text)
+    for key, value in fields.items():
+        if original.get(key) == str(value):
+            continue
+        value = str(value)
+        rendered = f'"{value}"' if re.search(r'[\s"]', value) or not value else value
+        pattern = re.compile(rf'(?<![\w.]){re.escape(key)}=("(?:[^"\\]|\\.)*"|\S+)')
+        if pattern.search(text):
+            text = pattern.sub(lambda match: f"{key}={rendered}", text, count=1)
+        else:
+            text = f"{text} {key}={rendered}"
+    return text
 
 
 def template_entry(rule):
@@ -420,8 +434,9 @@ def template_entry(rule):
         log, note = build_template(rule)
         if log is None:
             return None
-        text = json.dumps(log, indent=2)
-        check = judge(rule, events_of(text, "event"), rule["parser"])
+        is_text = isinstance(log, str)
+        text = log if is_text else json.dumps(log, indent=2)
+        check = judge(rule, events_of(text, "raw" if is_text else "event"), rule["parser"])
     except Exception:  # Leave out a rule whose query can't be turned into a log.
         return None
     return {
@@ -433,6 +448,7 @@ def template_entry(rule):
         "enabled": rule["enabled"],
         "verdict": check["verdict"],
         "note": note,
+        "format": "text" if is_text else "json",
         "log": text,
     }
 

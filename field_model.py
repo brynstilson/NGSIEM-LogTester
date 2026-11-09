@@ -2,11 +2,13 @@
 
 CrowdStrike's parsing standard keeps original vendor fields under a `Vendor.` prefix, sets tags
 such as #Vendor and #event.module, and maps some fields to ECS names like event.action. The
-real parsers aren't readable with this app's API scopes, so the ECS mappings below are
-best-effort and every match says what it relied on.
+mappings and input readers below follow the logic of the CrowdStrike parsers in the tenant, as
+read on 9 November 2026. Every match still says what it relied on, because parsers change.
 """
+import csv
 import json
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 from cql import closest
@@ -14,8 +16,10 @@ from cql import closest
 PREFIX = "Vendor."
 
 # Per parser: the #Vendor tag, likely #event.module values, display names, the built-in sample
-# that holds this source's raw format, and approximate ECS field mappings to raw paths.
-# A mapping's second item transforms the raw value: "lower", or "outcome:<success value>".
+# that holds this source's raw format, how to read a text log ("reader"), and ECS field mappings
+# to raw paths. A mapping's path can be a list, meaning the first one present, as with coalesce().
+# Its second item transforms the raw value: "lower", "slug" (lowercase, spaces to dashes),
+# "outcome:<success value>", "only:<value>" (set only for that value), or "map:<raw>=<value>,...".
 PROFILES = {
     "okta-sso": {
         "vendor": "okta", "modules": ["sso", "okta"], "display": ("Okta", "Okta SSO"), "sample": "okta",
@@ -32,13 +36,18 @@ PROFILES = {
         "sample": "microsoft-entra",
         "aliases": {
             "user.name": ("properties.userPrincipalName", None), "user.email": ("properties.userPrincipalName", None),
-            "source.ip": ("callerIpAddress", None), "event.action": ("operationName", None),
-            "event.outcome": ("resultType", "outcome:0"), "#event.outcome": ("resultType", "outcome:0"),
+            "source.ip": ("callerIpAddress", None), "event.action": ("operationName", "slug"),
+            "event.outcome": ("properties.status.errorCode", "outcome:0"),
+            "#event.outcome": ("properties.status.errorCode", "outcome:0"),
         },
     },
     "microsoft-windows": {
         "vendor": "microsoft", "modules": ["windows"], "display": ("Microsoft", "Windows"), "sample": "windows-system",
-        "aliases": {"event.code": ("event_id", None), "host.name": ("computer_name", None)},
+        "reader": "windows-xml",
+        "aliases": {
+            "event.code": ("Event.System.EventID", None), "host.name": ("Event.System.Computer", None),
+            "event.action": (["Event.EventData.OperationType", "Event.EventData.Action"], None),
+        },
     },
     "aws-cloudtrail": {
         "vendor": "aws", "modules": ["cloudtrail"], "display": ("AWS", "CloudTrail"), "sample": "aws-cloudtrail",
@@ -56,15 +65,12 @@ PROFILES = {
     "proofpoint-tap": {
         "vendor": "proofpoint", "modules": ["tap"], "display": ("Proofpoint", "TAP"), "sample": "proofpoint-tap",
         "categories": ["email"],
-        # The SIEM API returns events in arrays named by type, and CrowdStrike's TAP rules filter on
-        # the type: `event.action="delivered" Vendor.eventType="messagesDelivered"`.
-        "envelopes": {
-            "messagesDelivered": {"Vendor.eventType": "messagesDelivered", "event.action": "delivered"},
-            "messagesBlocked": {"Vendor.eventType": "messagesBlocked", "event.action": "blocked"},
-            "clicksPermitted": {"Vendor.eventType": "clicksPermitted"},
-            "clicksBlocked": {"Vendor.eventType": "clicksBlocked"},
-        },
+        # The parser reads one message per event and names its category from eventType.
         "aliases": {
+            "event.action": ("eventType", "map:messagesDelivered=messages-delivered,messagesBlocked=messages-blocked,"
+                                          "clicksPermitted=clicks-permitted,clicksBlocked=clicks-blocked"),
+            "#event.dataset": ("eventType", "map:messagesDelivered=tap.messagesdelivered,messagesBlocked=tap.messagesblocked,"
+                                            "clicksPermitted=tap.clickspermitted,clicksBlocked=tap.clicksblocked"),
             "email.from.address": ("sender", None), "email.subject": ("subject", None),
             "source.ip": ("senderIP", None), "email.to.address": ("recipient[0]", None),
         },
@@ -73,22 +79,26 @@ PROFILES = {
         "vendor": "fortinet", "modules": ["fortigate", "firewall"], "display": ("Fortinet", "FortiGate"),
         "sample": "fortinet-firewall",
         "aliases": {
-            "source.ip": ("srcip", None), "destination.ip": ("dstip", None), "event.action": ("action", None),
+            "source.ip": ("srcip", None), "destination.ip": ("dstip", None), "event.action": ("utmaction", "only:block"),
             "source.port": ("srcport", None), "destination.port": ("dstport", None),
         },
     },
     "paloalto-ngfw": {
         "vendor": "paloalto", "modules": ["firewall", "ngfw", "panos"], "display": ("Palo Alto", "NGFW"),
-        "sample": "paloalto-ngfw",
+        "sample": "paloalto-ngfw", "reader": "paloalto-csv",
         "aliases": {
-            "source.ip": ("src", None), "destination.ip": ("dst", None), "event.action": ("action", None),
-            "rule.name": ("rule", None), "source.port": ("sport", None), "destination.port": ("dport", None),
+            "source.ip": ("SourceAddress", None), "destination.ip": ("DestinationAddress", None),
+            "event.action": ("Action", None), "rule.name": ("RuleName", None), "user.name": ("SourceUser", None),
+            "source.port": ("SourcePort", None), "destination.port": ("DestinationPort", None),
         },
     },
     "paloalto-prisma-access": {
         "vendor": "paloalto", "modules": ["prisma", "prismaaccess", "globalprotect"], "display": ("Palo Alto", "Prisma Access"),
         "sample": "paloalto-prisma",
-        "aliases": {"user.name": ("SourceUserName", None), "source.ip": ("PublicIPv4", None)},
+        "aliases": {
+            "user.name": ("SourceUser", None), "source.ip": (["SourceAddress", "SourceIP"], None),
+            "event.action": (["Action", "EventName", "PolicyAction", "Subtype"], None),
+        },
     },
     "google-workspace": {
         "vendor": "google", "modules": ["workspace", "google_workspace"], "display": ("Google", "Workspace"),
@@ -101,8 +111,9 @@ PROFILES = {
     "cloudflare-waf": {
         "vendor": "cloudflare", "modules": ["waf", "cloudflare"], "display": ("Cloudflare", "WAF"), "sample": "cloudflare",
         "aliases": {
-            "source.ip": ("ClientIP", None), "url.domain": ("ClientRequestHost", None),
-            "http.response.status_code": ("EdgeResponseStatus", None), "event.action": ("SecurityAction", None),
+            "source.ip": ("ClientIP", None), "client.ip": ("ClientIP", None), "url.domain": ("ClientRequestHost", None),
+            "http.response.status_code": ("EdgeResponseStatus", None), "event.action": ("Action", None),
+            "http.request.id": ("RayID", None),
         },
     },
     "checkpoint-ngfw": {
@@ -115,14 +126,59 @@ PROFILES = {
     },
     "vmware-vcenter": {
         "vendor": "vmware", "modules": ["vcenter", "vsphere"], "display": ("VMware", "vCenter"), "sample": "vmware-vsphere",
-        "aliases": {"user.name": ("userName", None), "source.ip": ("ipAddress", None)},
+        "reader": "vcenter",
+        "aliases": {},
     },
-    "epic-ehr": {"vendor": "epic", "modules": ["ehr"], "display": ("Epic", "EHR"), "sample": "epic-ehr", "aliases": {}},
-    "claroty-xdome": {"vendor": "claroty", "modules": ["xdome"], "display": ("Claroty", "xDome"), "sample": "claroty-xdome", "aliases": {}},
+    "epic-ehr": {
+        "vendor": "epic", "modules": ["ehr"], "display": ("Epic", "EHR"), "sample": "epic-ehr", "reader": "epic",
+        "aliases": {"event.action": ("EventLog.E1Mid", None), "host.ip": ("Mnemonics.IP", None)},
+    },
+    "abnormal-emailsecurity": {
+        "vendor": "abnormal", "modules": ["email-security"], "display": ("Abnormal", "Email Security"),
+        "sample": "abnormal-security",
+        "aliases": {"event.action": ("remediationStatus", None), "source.ip": ("senderIpAddress", None)},
+    },
+    "netskope-sse": {
+        "vendor": "netskope", "modules": ["sse"], "display": ("Netskope", "SSE"), "sample": "netskope",
+        "aliases": {
+            "event.action": (["activity", "action"], "lower"), "user.name": (["user", "ur_normalized"], None),
+            "source.ip": ("srcip", None),
+        },
+    },
+    "snowflake-audit": {
+        "vendor": "snowflake", "modules": ["audit"], "display": ("Snowflake", "Audit"), "sample": "snowflake",
+        "aliases": {"event.action": ("EVENT_TYPE", None), "user.name": ("USER_NAME", None), "source.ip": ("CLIENT_IP", None)},
+    },
+    "claroty-xdome": {
+        "vendor": "claroty", "modules": ["xdome"], "display": ("Claroty", "xDome"), "sample": "claroty-xdome",
+        "aliases": {
+            "event.id": ("event_id", None), "source.ip": ("src_ip", None), "destination.ip": ("dst_ip", None),
+            "host.hostname": ("device_name", None), "user.name": ("username", None),
+        },
+    },
 }
 
 PARSER_TAGS = {"#event.module", "event.module", "#event.dataset", "event.dataset", "#event.kind", "#repo",
                "#ecs.version", "#Cps.version", "#observer.type", "#type", "@timestamp", "@ingesttimestamp"}
+
+# The first columns of a PAN-OS TRAFFIC log after its common header, in the order the
+# paloalto-ngfw parser reads them.
+PANOS_TRAFFIC_COLUMNS = [
+    "SourceAddress", "DestinationAddress", "NATSource", "NATDestination", "RuleName", "SourceUser",
+    "DestinationUser", "Application", "VirtualSystem", "SourceZone", "DestinationZone", "InboundInterface",
+    "OutboundInterface", "LogAction", "FUTUREUSE3", "SessionID", "RepeatCount", "SourcePort", "DestinationPort",
+    "NATSourcePort", "NATDestinationPort", "Flags", "Protocol", "Action", "Bytes", "BytesSent", "BytesReceived",
+    "Packets", "StartTime", "ElapsedTime", "Category", "FUTUREUSE4", "SequenceNumber", "ActionFlags",
+    "SourceCountry", "DestinationCountry", "FUTUREUSE5", "PacketsSent", "PacketsReceived", "SessionEndReason",
+    "DeviceGroupHierarchyLevel1", "DeviceGroupHierarchyLevel2", "DeviceGroupHierarchyLevel3",
+    "DeviceGroupHierarchyLevel4", "VirtualSystemName", "DeviceName",
+]
+PANOS_HEADER = ["FUTUREUSE1", "ReceiveTime", "Serial", "Type", "SubType", "FUTUREUSE2", "TimeGenerated"]
+SYSLOG_5424 = re.compile(r"^<(?P<pri>\d+)>(?P<version>\d+) (?P<ts>\S+) (?P<host>\S+) (?P<app>\S+) (?P<procid>\S+) "
+                         r"(?P<msgid>\S+) (?P<sd>-|(?:\[[^\]]*\])+)\s*(?P<message>.*)$", re.S)
+VCENTER_EVENT = re.compile(r"Event \[(?P<eventId>.*?)\] \[(?P<partInfo>.*?)\] \[(?P<createdTime>.*?)\] "
+                           r"\[(?P<eventType>.*?)\] \[(?P<severity>.*?)\] \[(?P<user>.*?)\] \[(?P<target>.*?)\] "
+                           r"\[(?P<chainId>.*?)\] \[(?P<desc>.*?)\]")
 
 
 def profile_for_parser(parser):
@@ -147,23 +203,6 @@ def profile_for_rule(vendor, module=None, sourcetype=None):
     return candidates[0] if len(candidates) >= 1 else (None, None)
 
 
-def expand_envelopes(event, parser):
-    """Split a vendor's batch envelope into events the way its parser would, with derived fields.
-
-    Returns a list of (event, derived fields) pairs. Events outside an envelope come back as-is.
-    """
-    _, profile = profile_for_parser(parser)
-    envelopes = (profile or {}).get("envelopes")
-    if not envelopes or not isinstance(event, dict) or not any(key in event for key in envelopes):
-        return [(event, {})]
-    pairs = []
-    for key, derived in envelopes.items():
-        for item in event.get(key) or []:
-            if isinstance(item, dict):
-                pairs.append((item, derived))
-    return pairs
-
-
 def flatten(value, path=""):
     if isinstance(value, dict):
         for key, item in value.items():
@@ -182,9 +221,85 @@ _KV = re.compile(r'(?:(?<=\s)|^|(?<=,))\s*([A-Za-z_][\w.]*)\s*(?:=|:\s)\s*("(?:[
 def text_fields(text):
     """Key/value pairs from a syslog-style line, as kvParse would roughly see them."""
     fields = {}
-    for key, value in _KV.findall(text):
+    for key, value in _KV.findall(re.sub(r"^<\d+>\s*", "", text)):
         fields.setdefault(key, value.strip('"'))
     return fields
+
+
+def _local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def _xml_fields(element, path, fields):
+    """Flatten XML the way parseXml does: attributes become _name, Data Name="x" becomes x."""
+    name = element.get("Name") if _local(element.tag) == "Data" and element.get("Name") else _local(element.tag)
+    here = f"{path}.{name}" if path else name
+    for attribute, value in element.attrib.items():
+        if not (_local(element.tag) == "Data" and attribute == "Name"):
+            fields[f"{here}._{_local(attribute)}"] = value
+    children = list(element)
+    if element.text and element.text.strip() and not children:
+        fields[here] = element.text.strip()
+    for child in children:
+        _xml_fields(child, here, fields)
+    return fields
+
+
+def read_windows_xml(text):
+    return _xml_fields(ET.fromstring(text.strip()), "", {})
+
+
+def read_epic(text):
+    header = SYSLOG_5424.match(text.strip())
+    message = header.group("message") if header else text
+    fields = {}
+    for name, value in re.findall(r'<Mnemonic Name="([^"]+)">\s*<Value[^>]*>(.*?)</Value>', message, re.S):
+        fields[f"Mnemonics.{name}"] = value.strip()
+    rest = re.sub(r"<Mnemonics>.*?</Mnemonics>", "", message, flags=re.S)
+    xml_start = rest.find("<")
+    if xml_start >= 0:
+        _xml_fields(ET.fromstring(rest[xml_start:]), "", fields)
+    return fields
+
+
+def read_vcenter(text):
+    header = SYSLOG_5424.match(text.strip())
+    message = header.group("message") if header else text
+    fields = {"message": message}
+    if header:
+        fields["appname"] = header.group("app")
+    event = VCENTER_EVENT.search(message)
+    if event:
+        fields.update({k: v for k, v in event.groupdict().items()})
+    return fields
+
+
+def read_paloalto_csv(text):
+    line = text.strip()
+    start = re.search(r"(?:^|\s)(\d*,\S)", line)
+    row = next(csv.reader([line[start.start(1):] if start else line]))
+    fields = dict(zip(PANOS_HEADER, row))
+    if fields.get("Type") == "TRAFFIC":
+        fields.update(zip(PANOS_TRAFFIC_COLUMNS, row[len(PANOS_HEADER):]))
+    return {k: v for k, v in fields.items() if v != ""}
+
+
+READERS = {
+    "windows-xml": read_windows_xml, "epic": read_epic, "vcenter": read_vcenter, "paloalto-csv": read_paloalto_csv,
+}
+
+
+def read_text(text, profile):
+    """A text log's fields as its parser would see them, without the Vendor. prefix."""
+    reader = READERS.get((profile or {}).get("reader"))
+    if reader:
+        try:
+            fields = reader(text)
+            if fields:
+                return fields
+        except (ET.ParseError, ValueError, StopIteration, AttributeError):
+            pass  # Not in the parser's format, so fall back to key=value pairs.
+    return text_fields(text)
 
 
 @dataclass
@@ -196,15 +311,19 @@ class Found:
     raw: str = ""
 
 
+def _first_path(path, raw):
+    paths = path if isinstance(path, list) else [path]
+    return next((p for p in paths if p in raw), paths[0])
+
+
 class EventView:
     """The fields a rule would probably see for one event."""
 
-    def __init__(self, event, parser=None, derived=None):
+    def __init__(self, event, parser=None):
         self.parser_key, self.profile = profile_for_parser(parser)
         self.parser = parser
-        self.derived = derived or {}
         if isinstance(event, str):
-            self.raw = text_fields(event)
+            self.raw = read_text(event, self.profile)
             self.rawstring = event
             self.is_text = True
         else:
@@ -216,12 +335,10 @@ class EventView:
         if name.startswith(PREFIX):
             return name[len(PREFIX):]
         alias = (self.profile or {}).get("aliases", {}).get(name)
-        return alias[0] if alias else name
+        return _first_path(alias[0], self.raw) if alias else name
 
     def lookup(self, name, op, expected):
         profile = self.profile
-        if name in self.derived:
-            return Found(self.derived[name], "set by the parser from the array the event came in (assumed)")
         if name == "#event.kind" and profile:
             return Found(profile.get("kind", "event"), f"set by the {self.parser} parser (assumed)")
         if name == "#repo" and profile and op == "!=" and str(expected).startswith(("xdr", "base_sensor", "detections")):
@@ -273,13 +390,12 @@ class EventView:
 
     def _alias(self, name, alias):
         path, transform = alias
+        path = _first_path(path, self.raw)
         if path not in self.raw:
             return Found(basis="missing (mapped)", raw=path)
-        value = self.raw[path]
-        if transform == "lower":
-            value = value.lower()
-        elif transform and transform.startswith("outcome:"):
-            value = "success" if value == transform.split(":", 1)[1] else "failure"
+        value = apply_transform(transform, self.raw[path])
+        if value is None:
+            return Found(basis="missing (mapped)", raw=path)
         return Found(value, f"mapped from {path} (approximate)", raw=path)
 
     def suggest_missing(self, name, op, kind, expected, basis):
@@ -287,12 +403,11 @@ class EventView:
             if name in ("#Vendor", "Vendor"):
                 return f'Send this through a connector whose parser tags #Vendor="{expected}".'
             return f"{name} is set by the parser, so this can't be checked from the raw log."
-        envelopes = (self.profile or {}).get("envelopes") or {}
-        for key, derived in envelopes.items():
-            if derived.get(name) == expected:
-                return f'The parser sets {name} from the batch array, so put the event inside {{"{key}": [ ... ]}}.'
         raw = self.raw_name(name)
         example = example_value(kind, expected)
+        transform = ((self.profile or {}).get("aliases", {}).get(name) or (None, None))[1]
+        if transform and example is not None:
+            example = raw_value_for(transform, example)
         near = closest(raw, list(self.raw))
         if near:
             return f'There is no field "{raw}". Did you mean "{near}"? It needs the value "{example}".'
@@ -319,12 +434,37 @@ class EventView:
         return f'Change "{raw}" from "{found.value}" to "{example}".'
 
 
+def _mapping(transform):
+    return dict(pair.split("=", 1) for pair in transform[len("map:"):].split(","))
+
+
+def apply_transform(transform, value):
+    """What a parser makes of a raw value. None means the parser sets nothing."""
+    if not transform:
+        return value
+    if transform == "lower":
+        return value.lower()
+    if transform == "slug":
+        return re.sub(r"\s+", "-", value.lower())
+    if transform.startswith("outcome:"):
+        return "success" if value == transform.split(":", 1)[1] else "failure"
+    if transform.startswith("only:"):
+        return value if value == transform.split(":", 1)[1] else None
+    if transform.startswith("map:"):
+        return _mapping(transform).get(value)
+    return value
+
+
 def raw_value_for(transform, value):
     """Undo a mapping's transform, giving the raw value that produces `value`."""
     if transform == "lower":
         return str(value).upper()
+    if transform == "slug":
+        return str(value).replace("-", " ").capitalize()
     if transform and transform.startswith("outcome:"):
         return transform.split(":", 1)[1] if str(value).lower() == "success" else "1"
+    if transform and transform.startswith("map:"):
+        return next((raw for raw, mapped in _mapping(transform).items() if mapped == value), value)
     return value
 
 

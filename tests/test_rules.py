@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cql import FALSE, TRUE, UNKNOWN, Evaluator, parse_rule, tokenize
 from field_model import EventView, text_fields
 from mock_falcon import CONFIGURED_RULES, RULE_TEMPLATES, _connection
-from rules import build_template, events_of, evaluate, judge, latest_configured, normalize, rule_templates
+from rules import build_template, events_of, evaluate, judge, latest_configured, normalize, rule_templates, template_entry
 from sample_events import render_sample
 from test_workflow import fast_settings, records, submit  # noqa: F401  (fixtures are shared below)
 from test_workflow import client, forensic_path, mock, web  # noqa: F401
@@ -162,9 +162,11 @@ def test_latest_published_version_is_used():
 def test_every_generated_template_is_judged_likely(raw):
     normalized = normalize(raw, "configured" if raw.get("rule_id") else "template")
     log, note = build_template(normalized)
-    text = json.dumps(log)
+    is_text = isinstance(log, str)
+    text = log if is_text else json.dumps(log)
     assert "NGSIEM-LogTester-TEST" in text
-    assert judge(normalized, events_of(text, "event"), normalized["parser"])["verdict"] == "likely", note
+    events = events_of(text, "raw" if is_text else "event")
+    assert judge(normalized, events, normalized["parser"])["verdict"] == "likely", note
 
 
 def test_threshold_templates_hold_enough_events():
@@ -284,8 +286,8 @@ TAP_RULE = (
 )
 
 
-def tap_message(score):
-    return dict(json.loads(render_sample("proofpoint-tap")), spamScore=score)
+def tap_message(score, event_type="messagesDelivered"):
+    return dict(json.loads(render_sample("proofpoint-tap")), spamScore=score, eventType=event_type)
 
 
 def test_repo_not_equal_xdr_is_not_an_endpoint_rule():
@@ -295,25 +297,33 @@ def test_repo_not_equal_xdr_is_not_an_endpoint_rule():
 
 def test_case_branches_are_an_or():
     tap = rule(TAP_RULE)
-    assert judge(tap, [{"messagesDelivered": [tap_message(90)]}], "proofpoint-tap")["verdict"] == "likely"
-    assert judge(tap, [{"messagesBlocked": [tap_message(90)]}], "proofpoint-tap")["verdict"] == "unlikely"
+    assert judge(tap, [tap_message(90)], "proofpoint-tap")["verdict"] == "likely"
+    assert judge(tap, [tap_message(90, "messagesBlocked")], "proofpoint-tap")["verdict"] == "unlikely"
 
 
-def test_batch_envelopes_are_split_into_events():
-    tap = rule(TAP_RULE)
-    result = judge(tap, [{"messagesDelivered": [tap_message(10), tap_message(90)]}], "proofpoint-tap")
-    assert result["matching_events"] == 1
+def test_proofpoint_event_action_comes_from_event_type_like_the_parser():
+    for event_type, action in [("messagesDelivered", "messages-delivered"), ("messagesBlocked", "messages-blocked"),
+                               ("clicksPermitted", "clicks-permitted"), ("clicksBlocked", "clicks-blocked")]:
+        assert check(f'event.action="{action}"', tap_message(1, event_type), "proofpoint-tap") is TRUE
+    assert check('event.action="messages-delivered"', tap_message(1, "somethingElse"), "proofpoint-tap") is not TRUE
 
 
-def test_a_lone_message_is_told_to_use_the_batch_array():
-    result = judge(rule(TAP_RULE), [tap_message(90)], "proofpoint-tap")
+def test_a_message_without_event_type_is_told_to_add_it():
+    message = tap_message(90)
+    del message["eventType"]
+    result = judge(rule(TAP_RULE), [message], "proofpoint-tap")
     assert result["verdict"] != "likely"
-    assert any("messagesDelivered" in s for s in result["suggestions"])
-    assert not any('Add the field "eventType"' in s for s in result["suggestions"])
+    assert any('"eventType"' in s and "messagesDelivered" in s for s in result["suggestions"])
+
+
+def test_a_batch_envelope_is_not_treated_as_events():
+    # The parser reads one message per event, so a {"messagesDelivered": [...]} wrapper isn't split.
+    result = judge(rule(TAP_RULE), [{"messagesDelivered": [tap_message(90)]}], "proofpoint-tap")
+    assert result["verdict"] != "likely"
 
 
 def test_no_suggestions_once_a_rule_matches():
-    result = judge(rule(TAP_RULE), [{"messagesDelivered": [tap_message(90)]}], "proofpoint-tap")
+    result = judge(rule(TAP_RULE), [tap_message(90)], "proofpoint-tap")
     assert result["suggestions"] == []
 
 
@@ -361,16 +371,17 @@ def test_a_template_used_by_a_configured_rule_is_listed_once(web, mock):
     assert "Okta - Admin role granted" not in [r["name"] for r in rules]
 
 
-def test_tap_template_is_built_inside_the_batch_array():
+def test_tap_template_is_one_message_with_its_event_type():
     tap = rule(TAP_RULE)
     tap["parser"] = "proofpoint-tap"
     log, _ = build_template(tap)
-    assert list(log) == ["messagesDelivered"]
+    assert log["eventType"] == "messagesDelivered"
+    assert "messagesDelivered" not in log
     assert judge(tap, [log], "proofpoint-tap")["verdict"] == "likely"
 
 
 def test_suggestions_follow_the_branch_closest_to_passing():
-    low = {"messagesDelivered": [tap_message(10)]}
+    low = tap_message(10)
     suggestions = judge(rule(TAP_RULE), [low], "proofpoint-tap")["suggestions"]
     assert any("spamScore" in s for s in suggestions)
     assert not any("messages-delivered" in s for s in suggestions)
@@ -422,7 +433,9 @@ def test_a_template_sample_loads_once_templates_are_loaded(web):
     entries = web.get("/api/rule-templates?templates=1").get_json()["templates"]
     template = next(t for t in entries if t["rule_source"] == "template")
     loaded = web.get(f"/api/sample-events/{template['id']}").get_json()
-    assert loaded["success"] and json.loads(loaded["log"])
+    assert loaded["success"] and loaded["log"]
+    if template["format"] == "json":
+        assert json.loads(loaded["log"])
 
 
 def test_a_configured_rule_sample_loads_without_templates(web, mock):
@@ -430,3 +443,104 @@ def test_a_configured_rule_sample_loads_without_templates(web, mock):
     loaded = web.get(f"/api/sample-events/{entries[0]['id']}").get_json()
     assert loaded["success"]
     assert TEMPLATE_CALLS not in mock.calls
+
+
+# ---------------------------------------------------------------- parser-aligned readers and mappings
+
+from field_model import EventView as View, read_text, PROFILES as PARSER_PROFILES
+
+
+def test_windows_xml_is_read_like_the_parser():
+    view = View(render_sample("windows-system"), "microsoft-windows")
+    assert view.raw["Event.System.EventID"] == "7036"
+    assert view.raw["Event.System.Channel"] == "System"
+    assert view.raw["Event.System.Provider._Name"] == "Service Control Manager"
+    assert view.raw["Event.EventData.param2"] == "running"
+    assert check('Vendor.Event.System.EventID="7036" event.code="7036"', render_sample("windows-system"), "microsoft-windows") is TRUE
+
+
+def test_vcenter_event_lines_are_read_like_the_parser():
+    view = View(render_sample("vmware-vsphere"), "vmware-vcenter")
+    assert view.raw["appname"] == "vpxd"
+    assert view.raw["eventType"] == "vim.event.UserLoginSessionEvent"
+    assert check("Vendor.eventType=/UserLogin/", render_sample("vmware-vsphere"), "vmware-vcenter") is TRUE
+
+
+def test_epic_xml_and_mnemonics_are_read_like_the_parser():
+    text = render_sample("epic-ehr")
+    view = View(text, "epic-ehr")
+    assert view.raw["EventLog.E1Mid"] == "LOGIN"
+    assert view.raw["Mnemonics.IP"] == "192.0.2.90"
+    assert check('event.action="LOGIN" Vendor.Mnemonics.SUCCESS="Yes"', text, "epic-ehr") is TRUE
+
+
+def test_paloalto_csv_is_read_by_column_like_the_parser():
+    text = render_sample("paloalto-ngfw")
+    view = View(text, "paloalto-ngfw")
+    assert view.raw["Type"] == "TRAFFIC"
+    assert view.raw["Action"] == "allow"
+    assert view.raw["SourceAddress"] == "192.0.2.140"
+    assert check('event.action="allow" source.ip="192.0.2.140" Vendor.RuleName=*rule', text, "paloalto-ngfw") is TRUE
+
+
+def test_paloalto_csv_after_a_syslog_header():
+    text = "<14>Nov 09 18:00:00 fw01 " + render_sample("paloalto-ngfw")
+    assert View(text, "paloalto-ngfw").raw["Action"] == "allow"
+
+
+def test_fortinet_key_values_after_the_priority():
+    view = View(render_sample("fortinet-firewall"), "fortinet-fortigate")
+    assert view.raw["date"] and view.raw["action"] == "accept"
+
+
+def test_fortinet_event_action_only_for_utm_blocks():
+    text = render_sample("fortinet-firewall")
+    assert check('event.action="accept"', text, "fortinet-fortigate") is not TRUE
+    assert check('event.action="block"', text + " utmaction=block", "fortinet-fortigate") is TRUE
+
+
+def test_entra_action_and_outcome_follow_the_parser():
+    entra = json.loads(render_sample("microsoft-entra"))
+    assert check('event.action="sign-in-activity" #event.outcome="success"', entra, "microsoft-entra-id") is TRUE
+    entra["properties"]["status"]["errorCode"] = 50126
+    assert check('#event.outcome="failure"', entra, "microsoft-entra-id") is TRUE
+
+
+def test_cloudflare_action_and_prisma_names_follow_the_parsers():
+    assert check('event.action="block"', json.loads(render_sample("cloudflare")), "cloudflare-waf") is TRUE
+    prisma = json.loads(render_sample("paloalto-prisma"))
+    assert check('event.action="gateway-connected" user.name="test.user@example.com"', prisma, "paloalto-prisma-access") is TRUE
+
+
+def test_a_reader_falls_back_to_key_values_for_other_text():
+    assert read_text("not xml at all key=value", PARSER_PROFILES["microsoft-windows"]) == {"key": "value"}
+
+
+def test_every_sample_names_its_parser_and_has_a_profile():
+    from sample_events import SAMPLES
+    for sample in SAMPLES:
+        if sample["id"] == "cisco-ucs":
+            assert sample["parser"] is None
+            continue
+        assert sample["parser"] in PARSER_PROFILES, sample["id"]
+        assert PARSER_PROFILES[sample["parser"]]["sample"] == sample["id"]
+
+
+def test_text_samples_keep_their_format_in_templates():
+    windows = rule('#Vendor="microsoft" #event.module="windows" Vendor.Event.System.EventID="4624"')
+    windows["parser"] = "microsoft-windows"
+    log, note = build_template(windows)
+    assert log.startswith("<Event")
+    assert "4624" in note
+    entry = template_entry(windows)
+    assert entry["format"] == "text"
+
+
+def test_fortinet_templates_edit_the_key_value_line():
+    fortinet = rule('#Vendor=fortinet Vendor.action="deny" Vendor.dstcountry="Testland"')
+    fortinet["parser"] = "fortinet-fortigate"
+    log, _ = build_template(fortinet)
+    assert isinstance(log, str) and log.startswith("<189>")
+    assert "action=deny" in log or 'action="deny"' in log
+    assert "dstcountry=Testland" in log
+    assert judge(fortinet, [log], "fortinet-fortigate")["verdict"] == "likely"

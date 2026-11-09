@@ -44,7 +44,8 @@ TEXT_IDS = sorted(s["id"] for s in SAMPLES if "text" in s)
 
 
 def test_syslog_sources_are_plain_text():
-    assert TEXT_IDS == ["cisco-firepower", "cisco-ucs", "epic-ehr"]
+    assert TEXT_IDS == ["cisco-firepower", "cisco-ucs", "epic-ehr", "fortinet-firewall", "paloalto-ngfw",
+                        "vmware-vsphere", "windows-system"]
     assert {s["id"] for s in list_samples() if s["format"] == "text"} == set(TEXT_IDS)
 
 

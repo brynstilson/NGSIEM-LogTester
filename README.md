@@ -66,7 +66,7 @@ apply to everyone using the installation.
 | `sample_events.py` | The built-in synthetic sample events |
 | `rules.py` | Loading correlation rules, judging a submission against them, and building rule templates |
 | `cql.py` | Reading a rule's CQL query and evaluating its filter against one event |
-| `field_model.py` | The approximation of what each parser gives a rule: tags, `Vendor.` fields and ECS mappings |
+| `field_model.py` | What each parser gives a rule: tags, `Vendor.` fields, ECS mappings and text-format readers |
 | `falcon_client.py` | Falcon API calls and the masked verbose log |
 | `forensic_log.py` | The append-only log on disk |
 | `app_settings.py` | Administrator settings: title, logo and contact details |
@@ -125,20 +125,50 @@ They use reserved addresses and contain no real people or patient data. The even
 
 | Label | Meaning | Sources |
 | --- | --- | --- |
-| Documented | Field names come from the vendor's own reference or example | Proofpoint TAP, AWS CloudTrail, AWS SecurityHub, Cloudflare, Google Workspace, Snowflake |
-| Partly documented | Some field names are confirmed; the rest follow a third-party example or the commonly seen format | Windows, Entra, Cisco Firepower, vSphere, Abnormal Security, Claroty xDome, Fortinet, Okta, Palo Alto NGFW, Palo Alto Prisma |
-| Approximate | No usable reference could be read, so check it against a real log | Cisco UCS, Check Point, Epic, Netskope |
+| Documented | Field names come from the vendor's own reference or example | Proofpoint TAP, Windows, AWS CloudTrail, AWS SecurityHub, Cloudflare, Fortinet, Google Workspace, Palo Alto NGFW, Snowflake |
+| Partly documented | Some field names are confirmed; the rest follow a third-party example or the commonly seen format | Entra, Cisco Firepower, vSphere, Abnormal Security, Claroty xDome, Epic, Okta, Palo Alto Prisma |
+| Approximate | No usable reference could be read, so check it against a real log | Cisco UCS, Check Point, Netskope |
 
-**A sample isn't guaranteed to parse.** It was written from public documentation, not captured from
-a product or checked against CrowdStrike's parsers. A real export may also wrap or batch events.
+### Matched to CrowdStrike's parsers
 
-**Parsers:** Falcon rejects a clone whose parser name it doesn't recognize. In live testing, the
-tenant's connector catalog had no parser for Cisco UCS, Abnormal Security, Netskope or Snowflake, and
-the likely names `cisco-ucs`, `abnormal-security`, `netskope` and `snowflake` were rejected. Those
-samples can only be sent through a connector that uses a parser your tenant has.
+Each sample is shaped for the CrowdStrike parser that handles its source. Its note names that parser,
+and so does the `parser` entry in `sample_events.py`. The samples were compared with the 318 parsers
+in the tenant on 9 November 2026, using each parser's own logic: how it recognizes its input, which
+field holds its timestamp, and which fields set `event.action`. The parsers include no example events,
+so this is a check against their logic, not a test run through them.
 
-**Syslog sources:** Cisco UCS, Cisco Firepower and Epic natively send syslog text, so their samples
-are bare lines. Selecting one switches the send mode to Raw.
+| Source | Parser | Format the parser expects |
+| --- | --- | --- |
+| Proofpoint TAP | `proofpoint-tap` | One message per event, with `eventType` (such as `messagesDelivered`), which sets `event.action` |
+| Windows | `microsoft-windows` | Native Windows event XML (Raw mode) |
+| Entra | `microsoft-entra-id` | Azure Monitor sign-in record |
+| Cisco Firepower | `cisco-firepower` | `%FTD` syslog line (Raw mode) |
+| vSphere | `vmware-vcenter` | vCenter `vpxd` syslog with its bracketed `Event [...]` format (Raw mode) |
+| AWS CloudTrail | `aws-cloudtrail` | CloudTrail record |
+| AWS SecurityHub | `aws-security-hub` | Finding in AWS Security Finding Format |
+| Abnormal Security | `abnormal-emailsecurity` | Threat message |
+| Check Point | `checkpoint-ngfw` | Log Exporter JSON |
+| Claroty xDome | `claroty-xdome` | Alert event with `alert_id`, `event_id` and device fields |
+| Cloudflare | `cloudflare-waf` | Firewall events record, with `Datetime` and `Action` |
+| Epic | `epic-ehr` | Syslog carrying Epic's `EventLog` XML and `Mnemonics` (Raw mode) |
+| Fortinet | `fortinet-fortigate` | key=value syslog (Raw mode). The parser has no JSON input |
+| Google Workspace | `google-workspace` | Admin Reports activity |
+| Netskope | `netskope-sse` | REST API event |
+| Okta | `okta-sso` | System Log event |
+| Palo Alto NGFW | `paloalto-ngfw` | PAN-OS positional CSV traffic log (Raw mode) |
+| Palo Alto Prisma | `paloalto-prisma-access` | GlobalProtect log with `LogType`, `EventName`, `SourceUser` and `SourceAddress` |
+| Snowflake | `snowflake-audit` | `LOGIN_HISTORY` row |
+| Cisco UCS | None | No CrowdStrike parser is available, so NG-SIEM won't parse it |
+
+**A sample still isn't guaranteed to parse.** The comparison was with the parsers' logic, and parsers
+are updated. To check a sample, send it and look at the parsed fields in Advanced Event Search.
+
+**Parser names:** Falcon rejects a clone whose parser name it doesn't recognize. A sample can only be
+sent through a connector that uses a parser your tenant has.
+
+**Text formats:** samples for sources that send text (Windows, Cisco UCS, Cisco Firepower, vSphere,
+Epic, Fortinet and Palo Alto NGFW) are in their native format. Selecting one switches the send mode
+to Raw.
 
 ## Correlation rules
 
@@ -167,8 +197,9 @@ For each rule a third-party log could trigger, the dropdown has a generated log:
 - **Labelled by source:** configured, configured but not enabled, or CrowdStrike template. A template
   that one of your configured rules was created from is listed once, as the configured rule.
 - **Built from the vendor's sample event,** changed to meet the rule's conditions. A rule that needs
-  several events gets enough of them, and a source that sends events in batches gets them in its
-  batch format, such as Proofpoint TAP's `{"messagesDelivered": [...]}`.
+  several events gets enough of them. Key=value text, such as Fortinet's, is edited field by field.
+  Other text formats, such as XML or CSV, are left as they are, and the note under the dropdown says
+  what to change.
 - **Rules over Falcon sensor data get no template,** because no third-party log can trigger them.
 
 All the page's dropdowns open a scrollable, left-aligned list in which long names wrap rather than
@@ -196,8 +227,8 @@ own rule. Other templates that can't be fully checked are only counted, so they 
 
 Each listed rule expands to show its conditions, what the log has, and what each check was based on.
 Suggestions name the raw field to add or change, catch case mismatches and near-miss field names,
-say how many events are still needed, and point out when a source expects a batch format. When a
-rule has `case` branches, suggestions follow the branch closest to passing.
+and say how many events are still needed. When a rule has `case` branches, suggestions follow the
+branch closest to passing.
 
 **Which parser is assumed:** the selected connector's parser. With no connector selected, the
 parser the selected sample or template was written for is used instead.
@@ -217,8 +248,10 @@ that aren't enabled never fire, so they don't need acknowledgement.
 **This is an estimate, not NG-SIEM's evaluation.** Rules match on fields the parser produces, such as
 `#Vendor`, `event.action` and `Vendor.*`, and the app only sees the raw log. Following CrowdStrike's
 parsing standard, it assumes raw fields appear under a `Vendor.` prefix. It takes `#Vendor` from the
-connector's parser, and assumes standard values for tags such as `#event.kind`. It uses approximate
-mappings for common ECS fields such as `event.action` (see `field_model.py`).
+connector's parser, and assumes standard values for tags such as `#event.kind`. Its mappings for
+common ECS fields such as `event.action`, and the way it reads text formats such as Windows XML,
+vCenter `Event [...]` lines and Palo Alto CSV, follow the logic of the tenant's parsers as read on
+9 November 2026 (see `field_model.py`). Parsers are updated, so these can drift.
 
 - **Understood:** comparisons, regexes, wildcards, `in()`, `cidr()`, `case { }` branches,
   `array:contains()`, and event-count thresholds after an aggregation.
