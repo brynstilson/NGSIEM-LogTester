@@ -348,7 +348,32 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
     return app
 
 
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def listen_address(environ=os.environ):
+    """Return (host, port, warnings) from HOST and PORT.
+
+    The default is localhost only, because the app has no login and acts with the API client's
+    rights. HOST=0.0.0.0 accepts connections from other machines, for client/server testing.
+    """
+    host = (environ.get("HOST") or "127.0.0.1").strip()
+    port = int(environ.get("PORT") or 5000)
+    warnings = []
+    if host not in LOOPBACK_HOSTS:
+        warnings.append(
+            f"WARNING: listening on {host}:{port}, so other machines can reach this app. It has no login "
+            "and acts with the Falcon API client's rights: anyone who can reach it can clone connectors and "
+            "send logs. Limit access with a firewall rule, and use it only on a trusted network.")
+        if not environ.get("APP_ADMIN_PASSWORD"):
+            warnings.append("WARNING: APP_ADMIN_PASSWORD isn't set, so anyone who can reach the app can "
+                            "change its settings.")
+    return host, port, warnings
+
+
 if __name__ == "__main__":
     load_dotenv()
-    # Bound to localhost only: the app has no login, and it acts with the API client's rights.
-    create_app().run(host="127.0.0.1", port=int(os.environ.get("PORT", 5000)), threaded=True)
+    bind_host, bind_port, bind_warnings = listen_address()
+    for warning in bind_warnings:
+        print(warning, flush=True)
+    create_app().run(host=bind_host, port=bind_port, threaded=True)
