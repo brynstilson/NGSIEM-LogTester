@@ -20,6 +20,45 @@ S3_CONNECTOR = {
 }
 
 
+# Rule queries written in the style of CrowdStrike's published dashboards and parsing standard.
+CONFIGURED_RULES = [
+    {
+        "id": "ver-1", "rule_id": "rule-okta-brute", "name": "Okta - Repeated failed logins", "status": "active",
+        "state": "published", "version": 2, "severity": 50, "tactic": "Credential Access", "technique": "Brute Force",
+        "search": {"filter": '#Vendor="okta" #event.module="sso" event.action="user.session.start" #event.outcome="failure"\n'
+                             '| groupBy([user.name], function=count(as=failures))\n| failures >= 5'},
+    },
+    {
+        "id": "ver-0", "rule_id": "rule-okta-brute", "name": "Okta - Repeated failed logins (old)", "status": "active",
+        "state": "draft", "version": 1, "severity": 50,
+        "search": {"filter": '#Vendor="okta" event.action="anything"'},
+    },
+    {
+        "id": "ver-2", "rule_id": "rule-aws-nomfa", "name": "AWS - Console login without MFA", "status": "active",
+        "state": "published", "version": 1, "severity": 70, "tactic": "Initial Access", "technique": "Valid Accounts",
+        "search": {"filter": '#Vendor="aws" #event.module="cloudtrail" event.action="ConsoleLogin"\n'
+                             '| Vendor.additionalEventData.MFAUsed="No" Vendor.responseElements.ConsoleLogin="Success"'},
+    },
+    {
+        "id": "ver-3", "rule_id": "rule-entra-mfa", "name": "Entra ID - MFA denied", "status": "inactive",
+        "state": "published", "version": 1, "severity": 40,
+        "search": {"filter": '#Vendor = microsoft AND @sourcetype = "microsoft-entra-id" AND #event.outcome != success\n'
+                             '| Vendor.properties.status.additionalDetails = "MFA denied*"'},
+    },
+]
+RULE_TEMPLATES = [
+    {"id": "tpl-pp", "name": "Proofpoint - Malicious message delivered", "severity": 70,
+     "search": {"filter": '#Vendor="proofpoint" Vendor.threatsInfoMap[0].classification=/malware|phish/i '
+                          'Vendor.threatsInfoMap[0].threatStatus="active"'}},
+    {"id": "tpl-ftnt", "name": "Fortinet - Allowed traffic to unexpected country", "severity": 40,
+     "search": {"filter": '#Vendor=fortinet Vendor.action="accept" | !in(field=Vendor.dstcountry, values=["United States", "Reserved"])'}},
+    {"id": "tpl-okta-admin", "name": "Okta - Admin role granted", "severity": 60,
+     "search": {"filter": '#Vendor="okta" event.action="user.account.privilege.grant"'}},
+    {"id": "tpl-edr", "name": "Endpoint - Encoded PowerShell", "severity": 70,
+     "search": {"filter": '#event_simpleName=ProcessRollup2 CommandLine=/-enc/i'}},
+]
+
+
 def _connection(id_, name, parser, source_type, vendor, product):
     return {
         "id": id_, "name": name, "parser_name": parser, "source_type": source_type, "status": "Active",
@@ -56,6 +95,9 @@ class MockFalcon:
         self.ingest_statuses = []  # Consumed per POST; 200 once empty.
         self.ingest_body = {"text": "Success", "code": 0}
         self.page_size_override = None
+        self.rules = [dict(rule) for rule in CONFIGURED_RULES]
+        self.templates = [dict(template) for template in RULE_TEMPLATES]
+        self.rules_status = 200
         self.app = self._build()
 
     def _build(self):
@@ -91,6 +133,23 @@ class MockFalcon:
         @app.get("/ngsiem/combined/connectors/v1")
         def list_connectors():
             return page(self.catalog)
+
+        @app.get("/correlation-rules/combined/rules/v1")
+        def correlation_rules():
+            if self.rules_status != 200:
+                return jsonify(errors=[{"code": self.rules_status, "message": "access denied, scope not permitted"}]), self.rules_status
+            return page(self.rules)
+
+        @app.get("/correlation-rules/queries/templates/v1")
+        def correlation_template_ids():
+            if self.rules_status != 200:
+                return jsonify(errors=[{"code": self.rules_status, "message": "access denied, scope not permitted"}]), self.rules_status
+            return page([template["id"] for template in self.templates])
+
+        @app.get("/correlation-rules/entities/templates/v1")
+        def correlation_templates():
+            wanted = set(request.args.getlist("ids"))
+            return jsonify(resources=[t for t in self.templates if t["id"] in wanted])
 
         @app.get("/ngsiem/entities/connections/v1")
         def get_connection():
