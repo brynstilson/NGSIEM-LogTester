@@ -24,9 +24,11 @@ SAMPLES = [
         "id": "proofpoint-tap",
         "label": "Proofpoint TAP log",
         "accuracy": DOCUMENTED,
-        "note": "One delivered-message record. The SIEM API returns these inside a messagesDelivered array.",
+        "parser": "proofpoint-tap",
+        "note": "One delivered message, as CrowdStrike's proofpoint-tap parser reads it: one message per event, with eventType naming the SIEM API category (messagesDelivered).",
         "source": "https://help.proofpoint.com/Threat_Insight_Dashboard/API_Documentation/SIEM_API",
         "event": {
+            "eventType": "messagesDelivered",
             "GUID": f"{MARKER}-GUID-0001",
             "QID": f"{MARKER}-QID",
             "ccAddresses": [],
@@ -70,31 +72,25 @@ SAMPLES = [
     {
         "id": "windows-system",
         "label": "Microsoft Windows system event log",
-        "accuracy": PARTIAL,
-        "note": "Service Control Manager event 7036 in the JSON shape Winlogbeat ships. Windows itself stores this as XML, and newer shippers use different field names.",
-        "source": "https://gist.github.com/andrewkroh/c88950a56e0d0b4dcee1",
-        "event": {
-            "@timestamp": "{{ISO_MS}}",
-            "computer_name": "WIN-TEST-01.example.com",
-            "count": 1,
-            "event_data": {"param1": f"{MARKER} Service", "param2": "running"},
-            "event_id": 7036,
-            "keywords": ["Classic"],
-            "level": "Information",
-            "log_name": "System",
-            "message": f"The {MARKER} Service service entered the running state.",
-            "process_id": 500,
-            "provider_guid": "{555908d1-a6d7-4695-8e1e-26931d2012f4}",
-            "record_number": "1190",
-            "source_name": "Service Control Manager",
-            "thread_id": 1848,
-            "type": "wineventlog",
-        },
+        "accuracy": DOCUMENTED,
+        "parser": "microsoft-windows",
+        "note": "Service Control Manager event 7036 as native Windows event XML, which is what CrowdStrike's microsoft-windows parser reads, so it uses Raw mode. The parser also accepts WinCollect and NXLog syslog.",
+        "source": "https://learn.microsoft.com/en-us/windows/win32/wes/eventschema-schema",
+        "text": (
+            "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+            "<Provider Name='Service Control Manager' Guid='{555908d1-a6d7-4695-8e1e-26931d2012f4}' EventSourceName='Service Control Manager'/>"
+            "<EventID Qualifiers='16384'>7036</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode>"
+            "<Keywords>0x8080000000000000</Keywords><TimeCreated SystemTime='{{ISO_MS}}'/><EventRecordID>1190</EventRecordID>"
+            "<Correlation/><Execution ProcessID='500' ThreadID='1848'/><Channel>System</Channel>"
+            "<Computer>WIN-TEST-01.example.com</Computer><Security/></System><EventData>"
+            f"<Data Name='param1'>{MARKER} Service</Data><Data Name='param2'>running</Data></EventData></Event>"
+        ),
     },
     {
         "id": "microsoft-entra",
         "label": "Microsoft Entra log",
         "accuracy": PARTIAL,
+        "parser": "microsoft-entra-id",
         "note": "A sign-in record as exported through Azure Monitor. Field names are documented, but Microsoft publishes no complete record, so the nesting of the details is from the common format.",
         "source": "https://learn.microsoft.com/en-us/entra/identity/monitoring-health/reference-azure-monitor-sign-ins-log-schema",
         "event": {
@@ -146,7 +142,8 @@ SAMPLES = [
         "id": "cisco-ucs",
         "label": "Cisco UCS log",
         "accuracy": APPROXIMATE,
-        "note": "A plain-text syslog line, as UCS Manager sends it, so it uses Raw mode. The %UCSM marker and fault F0209 are documented, but no published line was found, so the layout is a best estimate.",
+        "parser": None,
+        "note": "No CrowdStrike parser is available for Cisco UCS, so nothing in NG-SIEM will parse this. It's a plain-text syslog line, as UCS Manager sends it, so it uses Raw mode. The %UCSM marker and fault F0209 are documented, but the layout is a best estimate.",
         "source": "https://www.cisco.com/c/en/us/td/docs/unified_computing/ucs/ts/faults/reference/ErrMess/UCS_SEMs.html",
         "text": (
             f"{{{{SYSLOG}}}} {MARKER}-fi-a %UCSM-3-LINK_DOWN: [F0209][major][link-down]"
@@ -158,6 +155,7 @@ SAMPLES = [
         "id": "cisco-firepower",
         "label": "Cisco Firepower log",
         "accuracy": PARTIAL,
+        "parser": "cisco-firepower",
         "note": "Connection event 430003 as a plain-text syslog line, so it uses Raw mode. The layout follows a published third-party example.",
         "source": "https://docs.rapid7.com/insightidr/cisco-firepower-threat-defense/",
         "text": (
@@ -175,25 +173,20 @@ SAMPLES = [
         "id": "vmware-vsphere",
         "label": "VMware vSphere log",
         "accuracy": PARTIAL,
-        "note": "A vCenter UserLoginSessionEvent from the vSphere JSON API. Field names are documented, but the reference only gives placeholder values. vCenter's syslog output looks different.",
+        "parser": "vmware-vcenter",
+        "note": "A vCenter user login event as the RFC 5424 syslog line from the vpxd service, in the bracketed Event format CrowdStrike's vmware-vcenter parser reads, so it uses Raw mode.",
         "source": "https://developer.broadcom.com/xapis/virtual-infrastructure-json-api/latest/data-structures/UserLoginSessionEvent",
-        "event": {
-            "_typeName": "UserLoginSessionEvent",
-            "key": 1001,
-            "chainId": 1001,
-            "createdTime": "{{ISO_MS}}",
-            "userName": "EXAMPLE.COM\\test.user",
-            "fullFormattedMessage": f"User EXAMPLE.COM\\test.user@192.0.2.40 logged in as {MARKER}",
-            "ipAddress": "192.0.2.40",
-            "userAgent": MARKER,
-            "locale": "en",
-            "sessionId": "00000000-0000-0000-0000-000000000006",
-        },
+        "text": (
+            f"<14>1 {{{{ISO_MS}}}} {MARKER}-vcenter vpxd 4321 - - Event [1001] [1-1] [{{{{ISO_MS}}}}] "
+            "[vim.event.UserLoginSessionEvent] [info] [EXAMPLE.COM\\test.user] [] [1001] "
+            f"[User EXAMPLE.COM\\test.user@192.0.2.40 logged in as {MARKER}]"
+        ),
     },
     {
         "id": "aws-cloudtrail",
         "label": "AWS CloudTrail log",
         "accuracy": DOCUMENTED,
+        "parser": "aws-cloudtrail",
         "note": "A ConsoleLogin record following AWS's published example. CloudTrail delivers files holding a Records array of these.",
         "source": "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-aws-console-sign-in-events.html",
         "event": {
@@ -236,6 +229,7 @@ SAMPLES = [
         "id": "aws-securityhub",
         "label": "AWS SecurityHub log",
         "accuracy": DOCUMENTED,
+        "parser": "aws-security-hub",
         "note": "One finding in AWS Security Finding Format, with all required attributes. The detail-type wrapper EventBridge adds isn't included.",
         "source": "https://docs.aws.amazon.com/securityhub/latest/userguide/asff-required-attributes.html",
         "event": {
@@ -270,6 +264,7 @@ SAMPLES = [
         "id": "abnormal-security",
         "label": "Abnormal Security email log",
         "accuracy": PARTIAL,
+        "parser": "abnormal-emailsecurity",
         "note": "A threat message as returned by the threats API, following the sample in Netskope's integration docs. Abnormal's own API reference requires a customer login.",
         "source": "https://docs.netskope.com/en/abnormal-security-plugin-for-threat-exchange/",
         "event": {
@@ -310,6 +305,7 @@ SAMPLES = [
         "id": "checkpoint-ngfw",
         "label": "Checkpoint NGFW log",
         "accuracy": APPROXIMATE,
+        "parser": "checkpoint-ngfw",
         "note": "A firewall accept in Log Exporter's JSON format. Check Point documents the JSON option, but its sample pages couldn't be read, so these field names are from the commonly seen format.",
         "source": "https://sc1.checkpoint.com/documents/R81/WebAdminGuides/EN/CP_R81_SecurityManagement_AdminGuide/Topics-SECMG/CLI/cp_log_export.htm",
         "event": {
@@ -344,125 +340,106 @@ SAMPLES = [
         "id": "claroty-xdome",
         "label": "Claroty xDome log",
         "accuracy": PARTIAL,
-        "note": "An alert record following the example in the Hunters integration docs. Claroty's own reference requires a customer login.",
+        "parser": "claroty-xdome",
+        "note": "An alert event with the alert, event, device and connection fields CrowdStrike's claroty-xdome parser reads, such as alert_id, event_id, src_ip and device_name.",
         "source": "https://docs.hunters.ai/docs/claroty-xdome",
         "event": {
-            "id": 1000001,
-            "alert_type_name": "Network Change",
-            "category": "Device Changes",
-            "detected_time": "{{ISO_US}}",
-            "updated_time": "{{ISO_US}}",
-            "devices_count": 1,
-            "unresolved_devices_count": 1,
-            "medical_devices_count": 0,
-            "iot_devices_count": 1,
-            "it_devices_count": 0,
-            "ot_devices_count": 0,
+            "msg_category": "alert",
+            "alert_id": 1000001,
             "alert_name": f"{MARKER} Device Changed Network from Guest to Corporate",
+            "alert_type_name": "Network Change",
             "alert_class": "Device Changes Alerts",
-            "status": "Unresolved",
+            "alert_info": {"signature_severity": "High"},
+            "event_id": 138,
+            "event_description": f"{MARKER} device moved from the guest network to the corporate network",
+            "detected_time": "{{ISO_US}}",
+            "src_ip": "192.0.2.150",
+            "src_port": 56855,
+            "dst_ip": "198.51.100.150",
+            "dst_port": 102,
+            "protocol": "TCP",
+            "device_name": "TEST-PLC-01",
+            "device_uid": "00000000-0000-0000-0000-00000000000b",
+            "device_type": "PLC",
+            "device_site_name": "Test Site",
+            "username": "test.user",
         },
     },
     {
         "id": "cloudflare",
         "label": "Cloudflare log",
         "accuracy": DOCUMENTED,
-        "note": "One HTTP request from the Logpush http_requests dataset. Field names are documented. Which fields appear depends on the job's configuration, and the timestamp format is set per job.",
-        "source": "https://developers.cloudflare.com/logs/reference/log-fields/zone/http_requests/",
+        "parser": "cloudflare-waf",
+        "note": "One record from the Logpush firewall events dataset, which is what CrowdStrike's cloudflare-waf parser reads: it takes the time from Datetime and the action from Action.",
+        "source": "https://developers.cloudflare.com/logs/reference/log-fields/zone/firewall_events/",
         "event": {
-            "ClientIP": "203.0.113.80",
-            "ClientCountry": "us",
+            "Action": "block",
             "ClientASN": 64496,
-            "ClientSrcPort": 49152,
+            "ClientASNDescription": "EXAMPLE-AS",
+            "ClientCountry": "us",
+            "ClientIP": "203.0.113.80",
+            "ClientIPClass": "noRecord",
+            "ClientRefererHost": "",
+            "ClientRefererPath": "",
+            "ClientRefererQuery": "",
             "ClientRequestHost": "www.example.com",
             "ClientRequestMethod": "GET",
             "ClientRequestPath": f"/{MARKER}",
-            "ClientRequestURI": f"/{MARKER}?source=synthetic",
             "ClientRequestProtocol": "HTTP/2",
+            "ClientRequestQuery": "?source=synthetic",
             "ClientRequestScheme": "https",
             "ClientRequestUserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NGSIEM-LogTester",
-            "ClientRequestBytes": 512,
-            "ClientSSLProtocol": "TLSv1.3",
-            "ClientSSLCipher": "AEAD-AES128-GCM-SHA256",
-            "ClientIPClass": "noRecord",
-            "EdgeStartTimestamp": "{{ISO}}",
-            "EdgeEndTimestamp": "{{ISO}}",
-            "EdgeResponseStatus": 200,
-            "EdgeResponseBytes": 2048,
-            "EdgeResponseContentType": "text/html",
+            "Datetime": "{{ISO}}",
+            "Description": f"{MARKER} synthetic WAF rule match",
             "EdgeColoCode": "IAD",
-            "EdgeColoID": 1,
-            "CacheCacheStatus": "dynamic",
-            "SecurityAction": "allow",
-            "SecurityActions": ["allow"],
-            "SecuritySources": ["unknown"],
+            "EdgeResponseStatus": 403,
+            "Kind": "firewall",
+            "MatchIndex": 0,
+            "OriginResponseStatus": 0,
             "RayID": "0000000000000001",
-            "ZoneName": "example.com",
+            "RuleID": "00000000000000000000000000000001",
+            "Source": "firewallManaged",
         },
     },
     {
         "id": "epic-ehr",
         "label": "Epic Systems EHR log",
-        "accuracy": APPROXIMATE,
-        "note": "A plain-text CEF syslog line, as Epic sends it, so it uses Raw mode. No sample is public: field names come from Google's Epic parser docs, and the CEF header is a best estimate. It contains no patient data.",
+        "accuracy": PARTIAL,
+        "parser": "epic-ehr",
+        "note": "An Epic login audit event as RFC 5424 syslog carrying Epic's XML, with an EventLog element and Mnemonic name/value pairs, which is what CrowdStrike's epic-ehr parser reads. It uses Raw mode and contains no patient data.",
         "source": "https://docs.cloud.google.com/chronicle/docs/ingestion/default-parsers/epic",
         "text": (
-            f"{{{{SYSLOG}}}} {MARKER}-epic CEF:0|Epic|Security-SIEM|1.0|LOGIN|Login|3|"
-            "devTime={{EPOCH}} usrName=TESTUSER01 UID=TESTUSER01 IP=192.0.2.90 sev=LOW proto=TCP "
-            "shost=TEST-WORKSTATION-01 CLIENTNAME=TEST-WORKSTATION-01 APP=Hyperspace "
-            "SOURCE=Workstation SUCCESS=Yes DEP=TESTDEPARTMENT ROLE=TESTROLE "
-            f"PATIENT=SYNTHETIC-NO-PHI CTXT={MARKER}"
+            f"<14>1 {{{{ISO_US_OFFSET}}}} {MARKER}-epic EpicSIEM 12345 - [meta sequenceId=\"1\"] "
+            "<EventLog><EMPid>TESTUSER01</EMPid><E1Mid>LOGIN</E1Mid><Time>{{ISO_US_OFFSET}}</Time>"
+            "<Mnemonics><Mnemonic Name=\"IP\"><Value>192.0.2.90</Value></Mnemonic>"
+            "<Mnemonic Name=\"CLIENTNAME\"><Value>TEST-WORKSTATION-01</Value></Mnemonic>"
+            "<Mnemonic Name=\"SUCCESS\"><Value>Yes</Value></Mnemonic>"
+            "<Mnemonic Name=\"ROLE\"><Value>TESTROLE</Value></Mnemonic>"
+            f"<Mnemonic Name=\"LOGIN_CONTEXT\"><Value>{MARKER}</Value></Mnemonic></Mnemonics></EventLog>"
         ),
     },
     {
         "id": "fortinet-firewall",
         "label": "Fortinet firewall log",
-        "accuracy": PARTIAL,
-        "note": "A forward traffic log as FortiGate sends it with its JSON syslog format. Field names are documented for the default key=value format, but no published JSON sample was found.",
+        "accuracy": DOCUMENTED,
+        "parser": "fortinet-fortigate",
+        "note": "A forward traffic log as FortiGate's key=value syslog, the format CrowdStrike's fortinet-fortigate parser reads (it has no JSON input), so it uses Raw mode.",
         "source": "https://docs.fortinet.com/document/fortigate/7.2.4/fortios-log-message-reference/949981",
-        "event": {
-            "date": "{{DATE}}",
-            "time": "{{TIME}}",
-            "devname": f"{MARKER}-FGT",
-            "devid": "FGT00TEST0000001",
-            "eventtime": "{{EPOCH}}",
-            "tz": "+0000",
-            "logid": "0000000013",
-            "type": "traffic",
-            "subtype": "forward",
-            "level": "notice",
-            "vd": "root",
-            "srcip": "192.0.2.100",
-            "srcport": "49152",
-            "srcintf": "port2",
-            "srcintfrole": "lan",
-            "dstip": "198.51.100.100",
-            "dstport": "443",
-            "dstintf": "port1",
-            "dstintfrole": "wan",
-            "sessionid": "1000001",
-            "proto": "6",
-            "action": "accept",
-            "policyid": "1",
-            "policytype": "policy",
-            "service": "HTTPS",
-            "dstcountry": "Reserved",
-            "srccountry": "Reserved",
-            "trandisp": "snat",
-            "transip": "203.0.113.100",
-            "transport": "49152",
-            "duration": "60",
-            "sentbyte": "1200",
-            "rcvdbyte": "3400",
-            "sentpkt": "10",
-            "rcvdpkt": "8",
-            "appcat": "unscanned",
-        },
+        "text": (
+            f"<189>date={{{{DATE}}}} time={{{{TIME}}}} devname=\"{MARKER}-FGT\" devid=\"FGT00TEST0000001\" "
+            "eventtime={{EPOCH}} tz=\"+0000\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" "
+            "vd=\"root\" srcip=192.0.2.100 srcport=49152 srcintf=\"port2\" srcintfrole=\"lan\" dstip=198.51.100.100 "
+            "dstport=443 dstintf=\"port1\" dstintfrole=\"wan\" sessionid=1000001 proto=6 action=\"accept\" policyid=1 "
+            "policytype=\"policy\" service=\"HTTPS\" dstcountry=\"Reserved\" srccountry=\"Reserved\" trandisp=\"snat\" "
+            "transip=203.0.113.100 transport=49152 duration=60 sentbyte=1200 rcvdbyte=3400 sentpkt=10 rcvdpkt=8 "
+            "appcat=\"unscanned\""
+        ),
     },
     {
         "id": "google-workspace",
         "label": "Google Workspace log",
         "accuracy": DOCUMENTED,
+        "parser": "google-workspace",
         "note": "A login_success activity from the Admin Reports API. Structure and parameters are documented, but Google publishes no complete login record. The reference is unclear on id.time, so this uses an ISO timestamp.",
         "source": "https://developers.google.com/workspace/admin/reports/reference/rest/v1/activities/list",
         "event": {
@@ -498,6 +475,7 @@ SAMPLES = [
         "id": "netskope",
         "label": "Netskope log",
         "accuracy": APPROXIMATE,
+        "parser": "netskope-sse",
         "note": "An application event from the REST API v2. Netskope's pages confirmed the event types and _id, but not the other fields, so those are from the commonly seen format.",
         "source": "https://docs.netskope.com/en/using-the-rest-ap-v2-datasearch-endpoint",
         "event": {
@@ -532,6 +510,7 @@ SAMPLES = [
         "id": "okta",
         "label": "Okta log",
         "accuracy": PARTIAL,
+        "parser": "okta-sso",
         "note": "A user.session.start LogEvent. Top-level fields are documented, but Okta's page hides the nested fields, so those are from the commonly seen format.",
         "source": "https://developer.okta.com/docs/api/openapi/okta-management/management/tags/systemlog/other/listlogevents",
         "event": {
@@ -593,59 +572,23 @@ SAMPLES = [
     {
         "id": "paloalto-ngfw",
         "label": "Palo Alto NGFW log",
-        "accuracy": PARTIAL,
-        "note": "A traffic log using PAN-OS field names. PAN-OS sends positional CSV by default, so JSON like this only arrives through a custom log forwarding format.",
+        "accuracy": DOCUMENTED,
+        "parser": "paloalto-ngfw",
+        "note": "A traffic log in PAN-OS's positional CSV syslog format, with columns in the order CrowdStrike's paloalto-ngfw parser reads them, so it uses Raw mode.",
         "source": "https://docs.paloaltonetworks.com/ngfw/administration/monitoring/use-syslog-for-monitoring/syslog-field-descriptions/traffic-log-fields",
-        "event": {
-            "receive_time": "{{PANOS}}",
-            "serial": "000000000001",
-            "type": "TRAFFIC",
-            "subtype": "end",
-            "time_generated": "{{PANOS}}",
-            "src": "192.0.2.140",
-            "dst": "198.51.100.140",
-            "natsrc": "203.0.113.140",
-            "natdst": "198.51.100.140",
-            "rule": f"{MARKER}-rule",
-            "srcuser": "example\\test.user",
-            "dstuser": "",
-            "app": "ssl",
-            "vsys": "vsys1",
-            "from": "trust",
-            "to": "untrust",
-            "inbound_if": "ethernet1/2",
-            "outbound_if": "ethernet1/1",
-            "logset": "default",
-            "sessionid": 1000001,
-            "repeatcnt": 1,
-            "sport": 49152,
-            "dport": 443,
-            "natsport": 49152,
-            "natdport": 443,
-            "flags": "0x00400000",
-            "proto": "tcp",
-            "action": "allow",
-            "bytes": 4600,
-            "bytes_sent": 1200,
-            "bytes_received": 3400,
-            "packets": 18,
-            "start": "{{PANOS}}",
-            "elapsed": 60,
-            "category": "business-systems",
-            "seqno": 1000001,
-            "srcloc": "US",
-            "dstloc": "US",
-            "pkts_sent": 10,
-            "pkts_received": 8,
-            "session_end_reason": "tcp-fin",
-            "device_name": f"{MARKER}-fw",
-        },
+        "text": (
+            "1,{{PANOS}},000000000001,TRAFFIC,end,2561,{{PANOS}},192.0.2.140,198.51.100.140,203.0.113.140,198.51.100.140,"
+            f"{MARKER}-rule,example\\test.user,,ssl,vsys1,trust,untrust,ethernet1/2,ethernet1/1,default,{{{{PANOS}}}},"
+            "1000001,1,49152,443,49152,443,0x400000,tcp,allow,4600,1200,3400,18,{{PANOS}},60,business-systems,0,"
+            f"1000001,0x0,United States,United States,0,10,8,tcp-fin,0,0,0,0,,{MARKER}-fw"
+        ),
     },
     {
         "id": "paloalto-prisma",
         "label": "Palo Alto Prisma log",
         "accuracy": PARTIAL,
-        "note": "A Prisma Access GlobalProtect log. Field names come from the Strata Logging Service schema, which lists them flat with no example. This covers Prisma Access, not Prisma Cloud.",
+        "parser": "paloalto-prisma-access",
+        "note": "A Prisma Access GlobalProtect log using the field names CrowdStrike's paloalto-prisma-access parser reads, such as LogType, EventName, SourceUser and SourceAddress. This covers Prisma Access, not Prisma Cloud.",
         "source": "https://docs.paloaltonetworks.com/cortex/cortex-data-lake/log-forwarding-schema-reference/network-logs/network-globalprotect-log/network-globalprotect-https-fields",
         "event": {
             "TimeGenerated": "{{ISO}}",
@@ -659,7 +602,7 @@ SAMPLES = [
             "CortexDataLakeTenantID": "000000000000000000000000000000",
             "IsPrismaUsers": True,
             "IsPrismaNetworks": False,
-            "EventIDValue": "gateway-connected",
+            "EventName": "gateway-connected",
             "EventStatus": "success",
             "Stage": "tunnel",
             "AuthMethod": "SAML",
@@ -667,9 +610,9 @@ SAMPLES = [
             "TunnelType": "IPSec",
             "Gateway": "test-gateway",
             "Portal": "test-portal",
-            "SourceUserName": "test.user@example.com",
+            "SourceUser": "test.user@example.com",
             "SourceRegion": "US",
-            "PublicIPv4": "203.0.113.150",
+            "SourceAddress": "203.0.113.150",
             "PrivateIPv4": "10.0.0.150",
             "EndpointDeviceName": "TEST-WORKSTATION-01",
             "EndpointOSType": "Windows",
@@ -686,6 +629,7 @@ SAMPLES = [
         "id": "snowflake",
         "label": "Snowflake log",
         "accuracy": DOCUMENTED,
+        "parser": "snowflake-audit",
         "note": "One row from the ACCOUNT_USAGE LOGIN_HISTORY view as JSON. Column names are documented, but Snowflake has no native log export, so the exact JSON depends on your export job.",
         "source": "https://docs.snowflake.com/en/sql-reference/account-usage/login_history",
         "event": {
@@ -712,6 +656,7 @@ SAMPLE_IDS = {sample["id"] for sample in SAMPLES}
 
 def _tokens(now):
     return {
+        "{{ISO_US_OFFSET}}": now.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00"),
         "{{ISO_US}}": now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "{{ISO_MS}}": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "{{ISO}}": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -739,6 +684,7 @@ def list_samples():
     return [
         {
             **{key: sample[key] for key in ("id", "label", "accuracy", "note", "source")},
+            "parser": sample.get("parser"),
             "format": "text" if "text" in sample else "json",
         }
         for sample in SAMPLES

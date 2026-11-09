@@ -743,7 +743,7 @@
       failed.disabled = true;
       sampleSelect.append(failed);
     }
-    const templates = (ruleData.templates || []).map((t) => ({ ...t, format: "json" }));
+    const templates = (ruleData.templates || []).map((t) => ({ ...t, format: t.format || "json" }));
     const configuredCount = templates.filter((t) => t.rule_source === "configured").length;
     const templateCount = templates.length - configuredCount;
     if (ruleData.success && !configuredCount) {
