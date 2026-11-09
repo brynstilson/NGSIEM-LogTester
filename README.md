@@ -42,6 +42,21 @@ Keep this file private. Then start the app and open http://127.0.0.1:5000.
 
 On macOS or Linux, use `.venv/bin/python app.py`. Set `PORT` in `.env` to use a different port.
 
+## Application settings
+
+The **Settings** button at the top of the page lets an administrator set a header title, a company
+logo, and contact details (name, email, phone and a note) shown at the bottom of the page. Changes
+apply to everyone using the installation.
+
+- **Who can change them:** by default, anyone who can open the page. To limit changes to
+  administrators, set `APP_ADMIN_PASSWORD` in `.env` and restart the app. The dialog then asks for it.
+- **Logo:** PNG, JPEG, GIF or WebP, up to 1 MB. SVG isn't accepted, because it can carry script.
+- **Where they're stored:** `app_settings.json` and the `branding/` folder in the application directory.
+  Both are left out of Git, so each installation keeps its own. Set `APP_SETTINGS_PATH` and
+  `APP_BRANDING_DIR` to store them elsewhere.
+- **Audit trail:** each change is recorded in the forensic log as `settings_changed`. Logos are
+  recorded by size and SHA-256, not stored in the log.
+
 ## Code layout
 
 | File | Purpose |
@@ -54,6 +69,7 @@ On macOS or Linux, use `.venv/bin/python app.py`. Set `PORT` in `.env` to use a 
 | `field_model.py` | The approximation of what each parser gives a rule: tags, `Vendor.` fields and ECS mappings |
 | `falcon_client.py` | Falcon API calls and the masked verbose log |
 | `forensic_log.py` | The append-only log on disk |
+| `app_settings.py` | Administrator settings: title, logo and contact details |
 | `templates/index.html` | The operator page |
 | `tests/` | Tests, the mock Falcon API, and the sample log generator |
 
@@ -132,10 +148,15 @@ The app reads your tenant's configured correlation rules
 the **Correlation Rules: Read** scope. Without it, the app still sends logs, but the page shows that
 rules couldn't be checked, and the forensic log records that the submission wasn't screened.
 
-**Loading:** a tenant can have well over 1,000 templates, so the first load can take 15 seconds or
-more. The vendor samples appear straight away and the rule templates follow. Rules are then cached for
-15 minutes. After changing rules in Falcon, use **Reload rules** in the rule check panel under the
-log window.
+**Configured rules by default, templates on request:** the app loads only the rules configured in
+your tenant, which takes one API call. CrowdStrike's templates can run to well over 1,000, need many
+calls and can take 15 seconds or more, so they load only when you choose **Load samples for
+CrowdStrike rule templates** under the sample dropdown. Once loaded, template samples join the dropdown
+and the live check, and the same button hides them again. Submitting never loads the templates, because
+templates can't fire.
+
+Rules are cached for 15 minutes. After changing rules in Falcon, use **Reload rules** in the rule
+check panel under the log window.
 
 ### Rule templates in the dropdown
 
@@ -149,6 +170,9 @@ For each rule a third-party log could trigger, the dropdown has a generated log:
   several events gets enough of them, and a source that sends events in batches gets them in its
   batch format, such as Proofpoint TAP's `{"messagesDelivered": [...]}`.
 - **Rules over Falcon sensor data get no template,** because no third-party log can trigger them.
+
+All the page's dropdowns open a scrollable, left-aligned list in which long names wrap rather than
+being cut off. The sample list also has a filter box, which matches option and group names.
 
 The note under the dropdown names the rule a template was built for and gives the check's verdict.
 
@@ -264,6 +288,7 @@ submission:
 | `clone_delete_refused` | Clone details and why the delete limiter refused. Followed by `clone_delete_failed` |
 | `clone_deleted` or `clone_delete_failed` | Clone details, and the error if it failed |
 | `submission_finished` | Outcome, message, source connector, clone, and the verbose log |
+| `settings_changed` | OS user, client address, and the settings that changed. A new logo is recorded by file type, size and SHA-256 |
 
 - Records are flushed to disk as they happen, so a crash still leaves a trail of any clone it
   stranded. A `clone_created` with no matching `clone_deleted` is a clone to check for.

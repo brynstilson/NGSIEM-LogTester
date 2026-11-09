@@ -89,48 +89,62 @@ def latest_configured(resources):
 
 
 class RuleBook:
+    """Configured rules and CrowdStrike templates, cached separately.
+
+    Configured rules take one API call. The templates run to well over 1,000 and take many calls,
+    so they're only fetched when the operator asks for them.
+    """
+
     def __init__(self, client):
         self.client = client
-        self.rules = []
-        self.error = None
-        self.loaded_at = 0
+        self._cache = {"configured": ([], None, 0), "template": ([], None, 0)}
         self._lock = threading.Lock()
 
-    def load(self, log, refresh=False):
-        with self._lock:
-            if not refresh and self.loaded_at and time.time() - self.loaded_at < CACHE_SECONDS:
-                return self.rules
-            rules, errors = [], []
-            unreadable = []
-
-            def add(raw, source):
+    def _fetch(self, source, log):
+        rules, unreadable = [], []
+        fetch = (lambda: latest_configured(self.client.list_correlation_rules(log))) if source == "configured" \
+            else (lambda: self.client.list_correlation_rule_templates(log))
+        label = "Configured rules" if source == "configured" else "Rule templates"
+        try:
+            for raw in fetch():
                 try:
-                    rules.append(normalize(raw, source))
+                    rule = normalize(raw, source)
                 except Exception as exc:  # One odd rule mustn't hide all the others.
                     unreadable.append(raw.get("name") or raw.get("id"))
                     log.error(f"Couldn't read {source} rule {raw.get('name') or raw.get('id')}", repr(exc))
+                    continue
+                if rule["query"]:
+                    rules.append(rule)
+        except FalconError as exc:
+            return [], f"{label}: {exc}"
+        error = f"{label}: {len(unreadable)} couldn't be read, such as {unreadable[0]}." if unreadable else None
+        return rules, error
 
-            try:
-                for raw in latest_configured(self.client.list_correlation_rules(log)):
-                    add(raw, "configured")
-            except FalconError as exc:
-                errors.append(f"Configured rules: {exc}")
-            try:
-                for raw in self.client.list_correlation_rule_templates(log):
-                    add(raw, "template")
-            except FalconError as exc:
-                errors.append(f"Rule templates: {exc}")
-            in_use = {r["template_id"] for r in rules if r["source"] == "configured" and r["template_id"]}
-            rules = [r for r in rules if not (r["source"] == "template" and r["template_id"] in in_use)]
-            if unreadable:
-                errors.append(f"{len(unreadable)} rule(s) couldn't be read: {', '.join(map(str, unreadable[:5]))}.")
-            self.rules = [r for r in rules if r["query"]]
-            self.error = " ".join(errors) or None
-            self.loaded_at = time.time()
-            return self.rules
+    def _get(self, source, log, refresh):
+        with self._lock:
+            rules, error, loaded_at = self._cache[source]
+            if refresh or not loaded_at or time.time() - loaded_at >= CACHE_SECONDS:
+                rules, error = self._fetch(source, log)
+                self._cache[source] = (rules, error, time.time())
+            return rules, error
+
+    def templates_loaded(self):
+        return bool(self._cache["template"][2])
+
+    def load(self, log, refresh=False, include_templates=False):
+        """Configured rules, plus the templates if asked. Returns (rules, error message or None)."""
+        configured, error = self._get("configured", log, refresh)
+        if not include_templates:
+            return list(configured), error
+        templates, template_error = self._get("template", log, refresh)
+        # A template that a configured rule was created from is shown once, as the configured rule.
+        in_use = {r["template_id"] for r in configured if r["template_id"]}
+        rules = list(configured) + [t for t in templates if t["template_id"] not in in_use]
+        return rules, " ".join(e for e in (error, template_error) if e) or None
 
     def find(self, key):
-        return next((rule for rule in self.rules if rule["key"] == key), None)
+        source = "configured" if key.startswith("configured:") else "template"
+        return next((rule for rule in self._cache[source][0] if rule["key"] == key), None)
 
 
 # ---------------------------------------------------------------- judging a submission
@@ -398,32 +412,32 @@ def build_template(rule_info):
     return log, note
 
 
+def template_entry(rule):
+    """One dropdown entry: a generated log for a rule, or None if no third-party log fits it."""
+    if rule["endpoint_only"]:
+        return None
+    try:
+        log, note = build_template(rule)
+        if log is None:
+            return None
+        text = json.dumps(log, indent=2)
+        check = judge(rule, events_of(text, "event"), rule["parser"])
+    except Exception:  # Leave out a rule whose query can't be turned into a log.
+        return None
+    return {
+        "id": f"rule:{rule['key']}",
+        "label": rule["name"],
+        "group": f"{rule['vendor']} / {rule['product']}",
+        "rule_key": rule["key"],
+        "rule_source": rule["source"],
+        "enabled": rule["enabled"],
+        "verdict": check["verdict"],
+        "note": note,
+        "log": text,
+    }
+
+
 def rule_templates(rules):
     """Dropdown entries: one generated log per rule that a third-party log could trigger."""
-    entries = []
-    for rule in rules:
-        if rule["endpoint_only"]:
-            continue
-        try:
-            log, note = build_template(rule)
-        except Exception:  # Leave out a rule whose query can't be turned into a log.
-            continue
-        if log is None:
-            continue
-        text = json.dumps(log, indent=2)
-        try:
-            check = judge(rule, events_of(text, "event"), rule["parser"])
-        except Exception:
-            continue
-        entries.append({
-            "id": f"rule:{rule['key']}",
-            "label": rule["name"],
-            "group": f"{rule['vendor']} / {rule['product']}",
-            "rule_key": rule["key"],
-            "rule_source": rule["source"],
-            "enabled": rule["enabled"],
-            "verdict": check["verdict"],
-            "note": note,
-            "log": text,
-        })
+    entries = [entry for entry in (template_entry(rule) for rule in rules) if entry]
     return sorted(entries, key=lambda e: (e["group"], e["label"].lower()))

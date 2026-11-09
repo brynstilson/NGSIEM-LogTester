@@ -4,3 +4,5 @@ dist/
 .venv/
 __pycache__/
 .pytest_cache/
+app_settings.json
+branding/

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NG-SIEM Log Tester</title>
+<title>{{ title }}</title>
 <style>
   :root {
     --bg: #f5f6f8; --panel: #fff; --text: #1c2128; --muted: #5d6673; --line: #d5dae1;
@@ -78,13 +78,48 @@
   .check { display: flex; gap: 8px; align-items: flex-start; font-weight: 600; margin-top: 16px; }
   .check input { margin-top: 4px; }
   .end { justify-content: flex-end; margin-top: 16px; }
+  .brand { display: flex; align-items: center; gap: 14px; margin-bottom: 24px; }
+  .brand-text { flex: 1; min-width: 0; }
+  .brand .lede { margin: 0; }
+  .brand img { max-height: 56px; max-width: 160px; object-fit: contain; }
+  .picker { position: relative; width: 100%; }
+  .row .picker { flex: 1; min-width: 200px; }
+  .picker-button { width: 100%; display: flex; align-items: flex-start; gap: 8px; text-align: left; font-weight: 400; padding: 8px 10px; }
+  .picker-text { flex: 1; overflow-wrap: anywhere; white-space: normal; text-align: left; }
+  .picker-caret { color: var(--muted); }
+  .picker-panel { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; right: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 8px 24px rgba(0, 0, 0, .25); }
+  .picker-search { width: calc(100% - 16px); margin: 8px; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  .picker-list { max-height: min(60vh, 420px); overflow-y: auto; overscroll-behavior: contain; padding: 4px 0; text-align: left; }
+  .picker-group { padding: 8px 12px 4px; font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; overflow-wrap: anywhere; }
+  .picker-option { padding: 6px 12px 6px 20px; cursor: pointer; white-space: normal; overflow-wrap: anywhere; text-align: left; }
+  .picker-option:hover, .picker-option:focus { background: var(--bg); outline: none; }
+  .picker-option[aria-selected="true"] { font-weight: 600; }
+  .picker-option[aria-disabled="true"] { color: var(--muted); cursor: default; font-style: italic; }
+  .picker-empty { padding: 8px 12px; color: var(--muted); }
+  .templates-row { margin-top: 8px; }
+  .templates-row .hint { margin: 0; }
+  .field { margin-top: 12px; }
+  .field input, .field textarea { width: 100%; font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+  .field textarea { min-height: 70px; resize: vertical; background: var(--panel); color: var(--text); font: inherit; }
+  .logo-preview { display: block; max-height: 56px; max-width: 160px; margin-top: 8px; object-fit: contain; }
+  .error { color: var(--bad); font-weight: 600; margin-top: 12px; }
+  footer.contact { margin-top: 8px; color: var(--muted); font-size: 14px; }
+  footer.contact p { margin: 0 0 4px; overflow-wrap: anywhere; }
+  footer.contact a { color: inherit; }
+  .contact-note { white-space: pre-line; }
   [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 <main>
-  <h1>NG-SIEM Log Tester</h1>
-  <p class="lede">Send a raw JSON log through a clone of a data connector. The original connector isn't changed, and the clone is deleted afterwards.</p>
+  <header class="brand">
+    <img id="brand-logo" alt="" hidden>
+    <div class="brand-text">
+      <h1 id="brand-title">{{ title }}</h1>
+      <p class="lede">Send a raw JSON log through a clone of a data connector. The original connector isn't changed, and the clone is deleted afterwards.</p>
+    </div>
+    <button id="settings-open" type="button">Settings</button>
+  </header>
 
   <section>
     <label for="connector">Data connector</label>
@@ -105,6 +140,10 @@
   <section>
     <label for="sample">Built-in sample event</label>
     <select id="sample"><option value="">None: I'll paste my own log</option></select>
+    <div class="row templates-row">
+      <button id="templates-toggle" type="button">Load samples for CrowdStrike rule templates</button>
+      <p class="hint" id="templates-status">Only rules configured in your tenant are listed. Templates can take 15 seconds or more to load.</p>
+    </div>
     <p class="hint" id="sample-note" hidden><span id="sample-note-text"></span> <a id="sample-source" target="_blank" rel="noopener noreferrer">Format reference</a></p>
     <label for="log" class="below">Raw log</label>
     <textarea id="log" spellcheck="false" placeholder='{ "timestamp": "2026-11-01T12:00:00Z", "message": "example" }'></textarea>
@@ -140,7 +179,32 @@
       <div class="log" id="log-entries"></div>
     </details>
   </section>
+
+  <footer class="contact" id="contact" hidden></footer>
 </main>
+
+<dialog id="settings-dialog" aria-labelledby="settings-title">
+  <h2 id="settings-title">Application settings</h2>
+  <p class="hint">Customize this page for your organization. Changes apply to everyone who uses this installation.</p>
+  <div class="field"><label for="set-title">Header title</label><input id="set-title" maxlength="80"></div>
+  <div class="field">
+    <label for="set-logo">Company logo</label>
+    <input id="set-logo" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
+    <p class="hint">PNG, JPEG, GIF or WebP, up to 1 MB.</p>
+    <img id="set-logo-preview" class="logo-preview" alt="Current logo" hidden>
+    <label class="check" id="set-remove-logo-row" hidden><input type="checkbox" id="set-remove-logo"> Remove the current logo</label>
+  </div>
+  <div class="field"><label for="set-contact-name">Contact name</label><input id="set-contact-name" maxlength="80"></div>
+  <div class="field"><label for="set-contact-email">Contact email</label><input id="set-contact-email" type="email" maxlength="120"></div>
+  <div class="field"><label for="set-contact-phone">Contact phone</label><input id="set-contact-phone" type="tel" maxlength="40"></div>
+  <div class="field"><label for="set-contact-note">Contact note</label><textarea id="set-contact-note" maxlength="300" placeholder="For example: SOC hours, a ticket queue, or an escalation path"></textarea></div>
+  <div class="field" id="set-password-row" hidden><label for="set-password">Administrator password</label><input id="set-password" type="password" autocomplete="current-password"></div>
+  <p class="error" id="settings-error" role="alert" hidden></p>
+  <div class="row end">
+    <button id="settings-cancel" type="button">Cancel</button>
+    <button id="settings-save" type="button" class="primary">Save</button>
+  </div>
+</dialog>
 
 <dialog id="ack-dialog" aria-labelledby="ack-title">
   <h2 id="ack-title">Correlation rules will probably fire</h2>
@@ -159,7 +223,7 @@
   const sampleSelect = $("sample");
   let selected = null, busy = false, selectionRequest = 0;
   let samples = [], loadedSampleText = null, previousSampleId = "", sampleRequest = 0, rawChosenForSample = false;
-  let checkTimer = null, checkRequest = 0, pendingAcknowledgement = [];
+  let checkTimer = null, checkRequest = 0, pendingAcknowledgement = [], includeTemplates = false;
 
   function el(tag, props = {}, children = []) {
     const node = document.createElement(tag);
@@ -212,6 +276,225 @@
     ]));
   }
 
+  // ---------------------------------------------------------------- scrollable dropdowns
+  // Native <select> lists can't wrap long text, so each one gets a scrollable, left-aligned list.
+  // The hidden <select> stays the source of truth: the rest of the page reads and sets it as before.
+  const pickers = [];
+
+  function enhanceSelect(select, { searchable = false } = {}) {
+    const wrap = el("div", { className: "picker" });
+    const button = el("button", { type: "button", className: "picker-button", id: `${select.id}-picker` });
+    button.setAttribute("aria-haspopup", "listbox");
+    button.setAttribute("aria-expanded", "false");
+    const label = document.querySelector(`label[for="${select.id}"]`);
+    if (label) label.htmlFor = button.id;
+    const buttonText = el("span", { className: "picker-text" });
+    button.append(buttonText, el("span", { className: "picker-caret", textContent: "▾" }));
+    const panel = el("div", { className: "picker-panel", hidden: true });
+    const search = searchable ? el("input", { type: "search", className: "picker-search", placeholder: "Type to filter..." }) : null;
+    if (search) search.setAttribute("aria-label", "Filter options");
+    const list = el("div", { className: "picker-list", role: "listbox", tabIndex: -1 });
+    if (label) list.setAttribute("aria-label", label.textContent);
+    panel.append(...[search, list].filter(Boolean));
+    select.hidden = true;
+    select.setAttribute("aria-hidden", "true");
+    select.tabIndex = -1;
+    select.after(wrap);
+    wrap.append(button, panel);
+
+    function choose(option) {
+      if (option.disabled) return;
+      select.value = option.value;
+      select.dispatchEvent(new Event("change"));
+      close();
+      button.focus();
+      sync();
+    }
+
+    function item(option) {
+      const node = el("div", { className: "picker-option", role: "option", textContent: option.text, tabIndex: -1 });
+      node.setAttribute("aria-selected", String(option.value === select.value && option.selected));
+      if (option.disabled) node.setAttribute("aria-disabled", "true");
+      node.addEventListener("click", () => choose(option));
+      node.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          choose(option);
+        }
+      });
+      return node;
+    }
+
+    function build() {
+      const filter = search ? search.value.trim().toLowerCase() : "";
+      const matches = (text) => !filter || text.toLowerCase().includes(filter);
+      const nodes = [];
+      for (const child of select.children) {
+        if (child.tagName === "OPTGROUP") {
+          const groupMatches = matches(child.label);
+          const options = [...child.children].filter((o) => groupMatches || matches(o.text));
+          if (!options.length) continue;
+          nodes.push(el("div", { className: "picker-group", textContent: child.label }));
+          nodes.push(...options.map(item));
+        } else if (matches(child.text)) {
+          nodes.push(item(child));
+        }
+      }
+      if (!nodes.length) nodes.push(el("div", { className: "picker-empty", textContent: "No matches" }));
+      list.replaceChildren(...nodes);
+    }
+
+    function enabledOptions() {
+      return [...list.querySelectorAll(".picker-option:not([aria-disabled])")];
+    }
+
+    function open() {
+      if (button.disabled) return;
+      if (search) search.value = "";
+      build();
+      panel.hidden = false;
+      button.setAttribute("aria-expanded", "true");
+      const current = list.querySelector('[aria-selected="true"]');
+      if (current) current.scrollIntoView({ block: "nearest" });
+      (search || current || enabledOptions()[0] || list).focus();
+    }
+
+    function close() {
+      panel.hidden = true;
+      button.setAttribute("aria-expanded", "false");
+    }
+
+    function move(step) {
+      const options = enabledOptions();
+      if (!options.length) return;
+      const index = options.indexOf(document.activeElement);
+      const next = options[Math.max(0, Math.min(options.length - 1, index + step))] || options[0];
+      next.focus();
+      next.scrollIntoView({ block: "nearest" });
+    }
+
+    function sync() {
+      const selected = select.options[select.selectedIndex];
+      buttonText.textContent = selected ? selected.text : "";
+      button.disabled = select.disabled;
+      if (!panel.hidden) build();
+    }
+
+    button.addEventListener("click", () => (panel.hidden ? open() : close()));
+    button.addEventListener("keydown", (event) => {
+      if (["ArrowDown", "ArrowUp"].includes(event.key)) {
+        event.preventDefault();
+        open();
+      }
+    });
+    panel.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowDown") { event.preventDefault(); move(1); }
+      if (event.key === "ArrowUp") { event.preventDefault(); move(-1); }
+      if (event.key === "Escape") { event.preventDefault(); close(); button.focus(); }
+      if (event.key === "Tab") close();
+    });
+    if (search) search.addEventListener("input", build);
+    document.addEventListener("click", (event) => {
+      if (!wrap.contains(event.target)) close();
+    });
+    new MutationObserver(sync).observe(select, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "label"] });
+    select.addEventListener("change", sync);
+    sync();
+    const picker = { sync };
+    pickers.push(picker);
+    return picker;
+  }
+
+  function syncPickers() {
+    for (const picker of pickers) picker.sync();
+  }
+
+  // ---------------------------------------------------------------- administrator settings
+  let appSettings = null;
+
+  function applySettings(settings) {
+    appSettings = settings;
+    $("brand-title").textContent = settings.title;
+    document.title = settings.title;
+    const logo = $("brand-logo");
+    logo.hidden = !settings.logo_url;
+    if (settings.logo_url) {
+      logo.src = `${settings.logo_url}?v=${Date.now()}`;
+      logo.alt = `${settings.title} logo`;
+    }
+    const parts = [];
+    if (settings.contact_name) parts.push(el("span", { textContent: settings.contact_name }));
+    if (settings.contact_email) parts.push(el("a", { href: `mailto:${settings.contact_email}`, textContent: settings.contact_email }));
+    if (settings.contact_phone) parts.push(el("a", { href: `tel:${settings.contact_phone.replace(/[^0-9+]/g, "")}`, textContent: settings.contact_phone }));
+    const contact = $("contact");
+    contact.hidden = !parts.length && !settings.contact_note;
+    const line = el("p", {}, [el("strong", { textContent: "Contact: " })]);
+    parts.forEach((part, index) => line.append(...(index ? [" · ", part] : [part])));
+    contact.replaceChildren(...(parts.length ? [line] : []),
+      ...(settings.contact_note ? [el("p", { className: "contact-note", textContent: settings.contact_note })] : []));
+  }
+
+  async function loadSettings() {
+    const data = await callApi("/api/settings");
+    if (data.success) applySettings(data.settings);
+  }
+
+  function openSettings() {
+    const s = appSettings || {};
+    $("set-title").value = s.title || "";
+    $("set-contact-name").value = s.contact_name || "";
+    $("set-contact-email").value = s.contact_email || "";
+    $("set-contact-phone").value = s.contact_phone || "";
+    $("set-contact-note").value = s.contact_note || "";
+    $("set-logo").value = "";
+    $("set-remove-logo").checked = false;
+    $("set-remove-logo-row").hidden = !s.logo_url;
+    $("set-logo-preview").hidden = !s.logo_url;
+    if (s.logo_url) $("set-logo-preview").src = `${s.logo_url}?v=${Date.now()}`;
+    $("set-password-row").hidden = !s.password_required;
+    $("set-password").value = "";
+    $("settings-error").hidden = true;
+    $("settings-dialog").showModal();
+  }
+
+  function settingsError(message) {
+    $("settings-error").textContent = message;
+    $("settings-error").hidden = false;
+  }
+
+  async function saveSettings() {
+    const headers = { "X-Requested-By": "ngsiem-logtester", "X-Admin-Password": $("set-password").value };
+    $("settings-save").disabled = true;
+    const data = await callApi("/api/settings", {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: $("set-title").value,
+        contact_name: $("set-contact-name").value,
+        contact_email: $("set-contact-email").value,
+        contact_phone: $("set-contact-phone").value,
+        contact_note: $("set-contact-note").value,
+        remove_logo: $("set-remove-logo").checked,
+      }),
+    });
+    let result = data;
+    const file = $("set-logo").files[0];
+    if (data.success && file) {
+      const form = new FormData();
+      form.append("logo", file);
+      result = await callApi("/api/settings/logo", { method: "POST", headers, body: form });
+    }
+    $("settings-save").disabled = false;
+    if (!result.success) {
+      settingsError(result.message || "The settings couldn't be saved.");
+      if (data.success) applySettings(data.settings);
+      return;
+    }
+    applySettings(result.settings);
+    $("settings-dialog").close();
+    if (result.message) showResult(false, result.message, []);
+  }
+
   function scheduleCheck() {
     clearTimeout(checkTimer);
     checkTimer = setTimeout(runCheck, 400);
@@ -233,6 +516,7 @@
         mode: $("mode").value,
         connector_id: selected ? selected.id : null,
         sample_id: sampleSelect.value || null,
+        include_templates: includeTemplates,
       }),
     });
     if (request !== checkRequest) return;
@@ -332,6 +616,8 @@
     connectorSelect.disabled = busy || connectorSelect.options.length <= 1;
     sampleSelect.disabled = busy;
     $("refresh").disabled = busy;
+    $("templates-toggle").disabled = busy;
+    syncPickers();
   }
 
   function showResult(success, message, log) {
@@ -438,25 +724,36 @@
   async function loadSamples(refresh = false) {
     const previous = sampleSelect.value;
     // Vendor samples are instant. Rule templates can take a while the first time, so they follow.
-    const ruleRequest = callApi(`/api/rule-templates${refresh ? "?refresh=1" : ""}`);
+    const query = [refresh ? "refresh=1" : "", includeTemplates ? "templates=1" : ""].filter(Boolean).join("&");
+    const ruleRequest = callApi(`/api/rule-templates${query ? `?${query}` : ""}`);
     const data = await callApi("/api/sample-events");
     sampleSelect.replaceChildren(new Option("None: I'll paste my own log", ""));
     samples = data.success ? data.samples : [];
     if (samples.length) {
       sampleSelect.append(el("optgroup", { label: "Vendor sample logs" }, samples.map((s) => new Option(s.label, s.id))));
     }
-    const loading = new Option("Loading correlation rule templates...", "");
+    const loading = new Option(includeTemplates ? "Loading CrowdStrike rule templates..." : "Loading your correlation rules...", "");
     loading.disabled = true;
     sampleSelect.append(loading);
     if (samples.some((s) => s.id === previous)) sampleSelect.value = previous;
     const ruleData = await ruleRequest;
     loading.remove();
     if (!ruleData.success && !(ruleData.templates || []).length) {
-      const failed = new Option(`Correlation rule templates unavailable: ${ruleData.message || "unknown error"}`, "");
+      const failed = new Option(`Correlation rule samples unavailable: ${ruleData.message || "unknown error"}`, "");
       failed.disabled = true;
       sampleSelect.append(failed);
     }
     const templates = (ruleData.templates || []).map((t) => ({ ...t, format: "json" }));
+    const configuredCount = templates.filter((t) => t.rule_source === "configured").length;
+    const templateCount = templates.length - configuredCount;
+    if (ruleData.success && !configuredCount) {
+      const none = new Option("No configured correlation rules have a matching sample", "");
+      none.disabled = true;
+      sampleSelect.append(none);
+    }
+    $("templates-status").textContent = includeTemplates
+      ? `Showing ${configuredCount} configured rule sample${configuredCount === 1 ? "" : "s"} and ${templateCount} CrowdStrike template sample${templateCount === 1 ? "" : "s"}.`
+      : `Showing ${configuredCount} sample${configuredCount === 1 ? "" : "s"} for rules configured in your tenant. Templates can take 15 seconds or more to load.`;
     samples = samples.concat(templates);
     const groups = {};
     for (const t of templates) (groups[t.group] = groups[t.group] || []).push(t);
@@ -554,13 +851,26 @@
   }
 
   sampleSelect.addEventListener("change", selectSample);
+  $("templates-toggle").addEventListener("click", async () => {
+    includeTemplates = !includeTemplates;
+    const toggle = $("templates-toggle");
+    toggle.disabled = true;
+    $("templates-status").textContent = includeTemplates ? "Loading CrowdStrike rule templates. This can take 15 seconds or more..." : "Hiding template samples...";
+    await loadSamples();
+    toggle.disabled = false;
+    toggle.textContent = includeTemplates ? "Hide CrowdStrike rule template samples" : "Load samples for CrowdStrike rule templates";
+    scheduleCheck();
+  });
+  $("settings-open").addEventListener("click", openSettings);
+  $("settings-cancel").addEventListener("click", () => $("settings-dialog").close());
+  $("settings-save").addEventListener("click", saveSettings);
   $("mode").addEventListener("change", () => {
     rawChosenForSample = false;
     refreshControls();
     scheduleCheck();
   });
   $("rules-refresh").addEventListener("click", async () => {
-    await callApi("/api/rules?refresh=1");
+    await callApi(`/api/rules?refresh=1${includeTemplates ? "&templates=1" : ""}`);
     await loadSamples(true);
     runCheck();
   });
@@ -583,6 +893,10 @@
     if (parsed.value !== undefined) logInput.value = JSON.stringify(parsed.value, null, 2);
     refreshControls();
   });
+  enhanceSelect(connectorSelect);
+  enhanceSelect(sampleSelect, { searchable: true });
+  enhanceSelect($("mode"));
+  loadSettings();
   loadSamples();
   loadConnectors();
 </script>
