@@ -1,16 +1,19 @@
 """Operator web app for testing a raw JSON log against a clone of an NG-SIEM data connector."""
 import getpass
 import hashlib
+import hmac
 import os
 import uuid
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
+
+from app_settings import AppSettings, SettingsError
 
 from falcon_client import ActivityLog, FalconClient, FalconError
 from forensic_log import ForensicLog
 from field_model import PROFILES
-from rules import RuleBook, evaluate, group, rule_templates
+from rules import RuleBook, evaluate, group, rule_templates, template_entry
 from sample_events import SAMPLE_IDS, list_samples, render_sample
 from workflow import MODE_EVENT, MODE_RAW, Settings, connector_section, is_pull, submit_log
 
@@ -28,8 +31,12 @@ def _summary(connection):
     }
 
 
-def create_app(client=None, settings=None, forensic=None):
+def create_app(client=None, settings=None, forensic=None, app_settings=None, admin_password=None):
     app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
+    app_settings = app_settings or AppSettings()
+    # Optional. When set, only someone with the password can change the settings.
+    admin_password = os.environ.get("APP_ADMIN_PASSWORD") if admin_password is None else admin_password
     settings = settings or Settings()
     forensic = forensic or ForensicLog()
     client = client or FalconClient(
@@ -64,15 +71,93 @@ def create_app(client=None, settings=None, forensic=None):
             return rule["parser"] if rule else None
         return next((key for key, profile in PROFILES.items() if profile.get("sample") == sample_id), None)
 
-    def rule_check(text, mode, connection_id, log, sample_id=None):
-        rules = rulebook.load(log)
+    def rule_check(text, mode, connection_id, log, sample_id=None, include_templates=False):
+        """Judge a submission against configured rules, and templates too if the operator loaded them."""
+        rules, error = rulebook.load(log, include_templates=include_templates)
         parser = parser_for(connection_id, log) or sample_parser(sample_id)
         checked = evaluate(rules, text, mode, parser)
-        return rules, checked
+        return rules, checked, error
+
+    def wants_templates():
+        return request.args.get("templates") == "1"
 
     @app.get("/")
     def index():
-        return render_template("index.html")
+        # The saved title goes in the first paint, so the default never flashes up.
+        return render_template("index.html", title=app_settings.read()["title"])
+
+    def settings_payload():
+        values = app_settings.read()
+        return {**values, "logo_url": "/branding/logo" if values["logo"] else None,
+                "password_required": bool(admin_password)}
+
+    def admin_refusal():
+        """Why a settings change is refused, or None. Also blocks cross-site form posts."""
+        # A custom header can't be sent by another site's form or image without a CORS preflight.
+        if request.headers.get("X-Requested-By") != "ngsiem-logtester":
+            return jsonify(success=False, message="Missing request header."), 400
+        if admin_password and not hmac.compare_digest(
+                request.headers.get("X-Admin-Password", "").encode(), admin_password.encode()):
+            return jsonify(success=False, message="The administrator password is incorrect."), 403
+        return None
+
+    def record_settings_change(changes):
+        try:
+            forensic.write("settings_changed", str(uuid.uuid4()), operator=getpass.getuser(),
+                           remote_addr=request.remote_addr, changes=changes)
+            return None
+        except OSError as exc:
+            return f"The change was saved, but the forensic log couldn't be written: {exc}"
+
+    @app.get("/api/settings")
+    def get_settings():
+        return jsonify(success=True, settings=settings_payload())
+
+    @app.post("/api/settings")
+    def save_settings():
+        refusal = admin_refusal()
+        if refusal:
+            return refusal
+        data = request.get_json(silent=True)
+        if not request.is_json or not isinstance(data, dict):
+            return jsonify(success=False, message="Expected a JSON request."), 415
+        try:
+            changed = app_settings.update({k: v for k, v in data.items() if k != "remove_logo"})
+        except SettingsError as exc:
+            return jsonify(success=False, message=str(exc)), 400
+        if data.get("remove_logo") is True and app_settings.read()["logo"]:
+            app_settings.remove_logo()
+            changed["logo"] = "removed"
+        warning = record_settings_change(changed) if changed else None
+        return jsonify(success=True, settings=settings_payload(), changed=sorted(changed), message=warning)
+
+    @app.post("/api/settings/logo")
+    def upload_logo():
+        refusal = admin_refusal()
+        if refusal:
+            return refusal
+        upload = request.files.get("logo")
+        if upload is None:
+            return jsonify(success=False, message="Choose an image file."), 400
+        data = upload.read()
+        try:
+            name = app_settings.set_logo(data)
+        except SettingsError as exc:
+            return jsonify(success=False, message=str(exc)), 400
+        warning = record_settings_change({"logo": {"file": name, "bytes": len(data),
+                                                   "sha256": hashlib.sha256(data).hexdigest()}})
+        return jsonify(success=True, settings=settings_payload(), message=warning)
+
+    @app.get("/branding/logo")
+    def logo():
+        name = app_settings.read()["logo"]
+        path = app_settings.logo_path(name)
+        if not path:
+            return jsonify(success=False, message="No logo is set."), 404
+        response = send_file(path, mimetype=app_settings.content_type(name), max_age=0)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Content-Security-Policy"] = "default-src 'none'"
+        return response
 
     @app.get("/api/connectors")
     def list_connectors():
@@ -103,10 +188,10 @@ def create_app(client=None, settings=None, forensic=None):
     @app.get("/api/rules")
     def list_rules():
         log = ActivityLog()
-        rules = rulebook.load(log, refresh=request.args.get("refresh") == "1")
+        rules, error = rulebook.load(log, refresh=request.args.get("refresh") == "1", include_templates=wants_templates())
         return jsonify(
-            success=rulebook.error is None,
-            message=rulebook.error,
+            success=error is None,
+            message=error,
             rules=[public(rule) for rule in rules],
             configured=sum(1 for rule in rules if rule["source"] == "configured"),
             enabled=sum(1 for rule in rules if rule["enabled"]),
@@ -117,8 +202,9 @@ def create_app(client=None, settings=None, forensic=None):
     @app.get("/api/rule-templates")
     def list_rule_templates():
         log = ActivityLog()
-        entries = rule_templates(rulebook.load(log, refresh=request.args.get("refresh") == "1"))
-        return jsonify(success=rulebook.error is None, message=rulebook.error,
+        rules, error = rulebook.load(log, refresh=request.args.get("refresh") == "1", include_templates=wants_templates())
+        entries = rule_templates(rules)
+        return jsonify(success=error is None, message=error, templates_loaded=rulebook.templates_loaded(),
                        templates=[{k: v for k, v in entry.items() if k != "log"} for entry in entries])
 
     @app.post("/api/evaluate")
@@ -128,12 +214,12 @@ def create_app(client=None, settings=None, forensic=None):
             return jsonify(success=False, message="Expected a JSON request."), 415
         log = ActivityLog()
         text = data.get("log") if isinstance(data.get("log"), str) else ""
-        rules, checked = rule_check(text, data.get("mode", MODE_EVENT), data.get("connector_id"), log,
-                                    data.get("sample_id"))
+        rules, checked, error = rule_check(text, data.get("mode", MODE_EVENT), data.get("connector_id"), log,
+                                           data.get("sample_id"), data.get("include_templates") is True)
         return jsonify(
             success=True,
-            rules_available=rulebook.error is None,
-            message=rulebook.error,
+            rules_available=error is None,
+            message=error,
             rule_count=len(rules),
             events=checked["events"],
             groups=group(checked["results"]),
@@ -143,7 +229,8 @@ def create_app(client=None, settings=None, forensic=None):
     @app.get("/api/sample-events/<sample_id>")
     def sample_event(sample_id):
         if sample_id.startswith("rule:"):
-            entry = next((e for e in rule_templates(rulebook.load(ActivityLog())) if e["id"] == sample_id), None)
+            rule = rulebook.find(sample_id[len("rule:"):])
+            entry = template_entry(rule) if rule else None
             if entry is None:
                 return jsonify(success=False, message=f"Unknown rule template: {sample_id}"), 404
             return jsonify(success=True, log=entry["log"], note=entry["note"], verdict=entry["verdict"])
@@ -166,8 +253,9 @@ def create_app(client=None, settings=None, forensic=None):
         sample_id = data.get("sample_id")
         sample_id = sample_id if isinstance(sample_id, str) and (sample_id in SAMPLE_IDS or sample_id.startswith("rule:")) else None
 
-        # Configured rules this submission would probably fire must be acknowledged first.
-        rules, checked = rule_check(text, mode, connection_id, log)
+        # Configured rules this submission would probably fire must be acknowledged first. Templates
+        # never fire, so they aren't loaded for this.
+        rules, checked, rule_error = rule_check(text, mode, connection_id, log)
         firing = checked["will_fire"]
         acknowledged = data.get("acknowledged_rules") if isinstance(data.get("acknowledged_rules"), list) else []
         unacknowledged = [rule for rule in firing if rule["key"] not in acknowledged]
@@ -180,8 +268,8 @@ def create_app(client=None, settings=None, forensic=None):
                 log=log.entries,
             )
         rule_summary = {
-            "status": "unavailable" if rulebook.error else "checked",
-            "error": rulebook.error,
+            "status": "unavailable" if rule_error else "checked",
+            "error": rule_error,
             "rules_checked": len(rules),
             "acknowledged": [{"key": r["key"], "name": r["name"], "vendor": r["vendor"], "product": r["product"]} for r in firing],
         }
@@ -207,8 +295,8 @@ def create_app(client=None, settings=None, forensic=None):
             log.error(message)
             return jsonify(success=False, message=message, log=log.entries)
         log.info(f"Forensic record {submission_id} opened in {forensic.path.name}")
-        if rulebook.error:
-            log.error("Correlation rules couldn't be checked, so this submission wasn't screened for them.", rulebook.error)
+        if rule_error:
+            log.error("Correlation rules couldn't be checked, so this submission wasn't screened for them.", rule_error)
         elif firing:
             log.info(f"Operator acknowledged {len(firing)} correlation rule(s) that will probably fire: "
                      + ", ".join(rule["name"] for rule in firing))

@@ -186,7 +186,7 @@ def test_templates_are_grouped_by_vendor_and_product():
 # ---------------------------------------------------------------- the app
 
 def test_rules_route_reports_counts(web):
-    data = web.get("/api/rules").get_json()
+    data = web.get("/api/rules?templates=1").get_json()
     assert data["success"]
     assert (data["configured"], data["enabled"], data["templates"]) == (3, 2, 4)
     assert all("_rule" not in r for r in data["rules"])
@@ -201,7 +201,7 @@ def test_missing_scope_is_reported_and_doesnt_block_submitting(web, mock):
 
 
 def test_rule_templates_route_lists_grouped_entries(web):
-    templates = web.get("/api/rule-templates").get_json()["templates"]
+    templates = web.get("/api/rule-templates?templates=1").get_json()["templates"]
     assert {"AWS / CloudTrail", "Okta / Okta SSO", "Proofpoint / TAP"} <= {t["group"] for t in templates}
     assert all("log" not in t for t in templates)
     entry = next(t for t in templates if t["label"].startswith("AWS"))
@@ -211,9 +211,9 @@ def test_rule_templates_route_lists_grouped_entries(web):
 
 def test_evaluate_route_groups_results(web):
     log = web.get("/api/sample-events/" + next(
-        t["id"] for t in web.get("/api/rule-templates").get_json()["templates"] if t["label"].startswith("AWS")
+        t["id"] for t in web.get("/api/rule-templates?templates=1").get_json()["templates"] if t["label"].startswith("AWS")
     )).get_json()["log"]
-    data = web.post("/api/evaluate", json={"log": log, "mode": "event"}).get_json()
+    data = web.post("/api/evaluate", json={"log": log, "mode": "event", "include_templates": True}).get_json()
     assert data["success"] and data["rule_count"] == 7
     assert [g["group"] for g in data["will_fire"]] == ["AWS / CloudTrail"]
 
@@ -346,7 +346,7 @@ def test_a_comparison_with_a_computed_value_is_unknown():
 def test_one_unreadable_rule_doesnt_stop_the_others(web, mock):
     mock.templates.append({"id": "tpl-bad", "name": "Broken", "search": {"filter": None}, "vendors": ["X"]})
     mock.templates.append({"id": "tpl-odd", "name": "Odd", "search": {"filter": '"unterminated'}})
-    data = web.get("/api/rules?refresh=1").get_json()
+    data = web.get("/api/rules?refresh=1&templates=1").get_json()
     assert data["templates"] >= 4
 
 
@@ -357,7 +357,7 @@ def test_templates_use_the_vendors_list_for_grouping():
 
 def test_a_template_used_by_a_configured_rule_is_listed_once(web, mock):
     mock.rules[0]["template_id"] = "tpl-okta-admin"
-    rules = web.get("/api/rules?refresh=1").get_json()["rules"]
+    rules = web.get("/api/rules?refresh=1&templates=1").get_json()["rules"]
     assert "Okta - Admin role granted" not in [r["name"] for r in rules]
 
 
@@ -379,3 +379,54 @@ def test_suggestions_follow_the_branch_closest_to_passing():
 def test_vendor_comes_from_an_unmapped_parsers_name():
     assert check('#Vendor="vmware"', OKTA, "vmware-esxi") is TRUE
     assert check('#Vendor="okta"', OKTA, "vmware-esxi") is FALSE
+
+
+# ---------------------------------------------------------------- configured rules by default, templates on request
+
+TEMPLATE_CALLS = ("GET", "/correlation-rules/queries/templates/v1")
+
+
+def test_only_configured_rules_load_by_default(web, mock):
+    data = web.get("/api/rules").get_json()
+    assert (data["configured"], data["templates"]) == (3, 0)
+    entries = web.get("/api/rule-templates").get_json()
+    assert {t["rule_source"] for t in entries["templates"]} == {"configured"}
+    assert entries["templates_loaded"] is False
+    assert TEMPLATE_CALLS not in mock.calls
+
+
+def test_templates_load_only_when_asked(web, mock):
+    entries = web.get("/api/rule-templates?templates=1").get_json()
+    assert "template" in {t["rule_source"] for t in entries["templates"]}
+    assert entries["templates_loaded"] is True
+    assert mock.calls.count(TEMPLATE_CALLS) == 1
+    web.get("/api/rule-templates?templates=1")
+    assert mock.calls.count(TEMPLATE_CALLS) == 1  # Cached.
+
+
+def test_live_check_includes_templates_only_when_asked(web, mock):
+    log = render_sample("okta")
+    without = web.post("/api/evaluate", json={"log": log, "mode": "event"}).get_json()
+    assert without["rule_count"] == 3
+    assert TEMPLATE_CALLS not in mock.calls
+    with_templates = web.post("/api/evaluate", json={"log": log, "mode": "event", "include_templates": True}).get_json()
+    assert with_templates["rule_count"] == 7
+
+
+def test_submitting_never_loads_templates(web, mock):
+    assert submit(web)["success"]
+    assert TEMPLATE_CALLS not in mock.calls
+
+
+def test_a_template_sample_loads_once_templates_are_loaded(web):
+    entries = web.get("/api/rule-templates?templates=1").get_json()["templates"]
+    template = next(t for t in entries if t["rule_source"] == "template")
+    loaded = web.get(f"/api/sample-events/{template['id']}").get_json()
+    assert loaded["success"] and json.loads(loaded["log"])
+
+
+def test_a_configured_rule_sample_loads_without_templates(web, mock):
+    entries = web.get("/api/rule-templates").get_json()["templates"]
+    loaded = web.get(f"/api/sample-events/{entries[0]['id']}").get_json()
+    assert loaded["success"]
+    assert TEMPLATE_CALLS not in mock.calls
