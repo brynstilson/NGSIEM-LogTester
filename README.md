@@ -1,12 +1,21 @@
 # NG-SIEM Log Tester
 
 A local web app that sends a raw JSON log through a clone of an NG-SIEM data connector, so a
-connector's parser can be exercised without touching the original connector.
+connector's parser can be exercised without touching the original connector. It also estimates
+whether a log will trigger your correlation rules, and warns before sending one that probably will.
 
 ## Setup
 
-You need Python (tested on 3.14) and a Falcon API client with the **NGSIEM Data Connections API**
-scope, Read and Write. The client gives you a client ID and a client secret, and the app needs both.
+You need Python (tested on 3.14) and a Falcon API client. The client gives you a client ID and a
+client secret, and the app needs both. Give it these scopes:
+
+| Scope | Access | Used for |
+| --- | --- | --- |
+| NGSIEM Data Connections | Read and Write | Listing connectors, reading parsers, creating and deleting clones, ingest tokens |
+| Correlation Rules | Read | Reading configured rules and CrowdStrike's rule templates |
+
+Correlation Rules Write isn't needed. Without the Correlation Rules scope, the app still sends logs,
+but it can't check them against rules.
 
 On Windows:
 
@@ -61,8 +70,11 @@ real authentication in front of it before sharing it with other operators.
 2. **Reads the parser on selection.** `GET /ngsiem/entities/connections/v1`, reading `parser_name`.
    The result is kept in server memory for step 4. Pull connectors are read again at submit.
 3. **Takes a raw log.** One JSON object, or an array of objects to send several events. Raw mode
-   also accepts plain text, such as a syslog line.
-4. **Clones and sends on submit:**
+   also accepts plain text, such as a syslog line. As you edit, the page estimates which
+   correlation rules the log would trigger. See [Correlation rules](#correlation-rules).
+4. **Checks correlation rules on submit.** If the log will probably trigger an enabled rule in your
+   tenant, the app stops before cloning anything and asks you to acknowledge those rules.
+5. **Clones and sends:**
    - Falcon has no clone call, so a clone is a new connection with the same parser and vendor
      details: `POST /ngsiem/entities/connections/v1`, named `<source>-clone-<UTC timestamp>`. Falcon
      keeps only the first 50 characters of a name, so long source names are shortened to fit.
@@ -74,16 +86,18 @@ real authentication in front of it before sharing it with other operators.
    - The log is POSTed to the ingest URL with `Authorization: Bearer <token>`. A rejected send is
      tried up to six times in total, 5 seconds apart, because some new tokens took longer than
      15 seconds to become active in live testing.
-5. **Deletes the clone.** `DELETE /ngsiem/entities/connections/v1`, retried up to three times. This
+6. **Deletes the clone.** `DELETE /ngsiem/entities/connections/v1`, retried up to three times. This
    runs whether or not the log was sent, and passes through the delete limiter below.
-6. **Reports success or failure**, with an expandable log of every step and HTTP exchange.
+7. **Reports success or failure**, with an expandable log of every step and HTTP exchange.
    Credentials and tokens are masked in that log. A submission counts as failed if its clone
    couldn't be deleted, and the message names the clone to remove by hand.
 
 ## Built-in sample events
 
-The "Built-in sample event" dropdown fills the log window with a synthetic event for one of 20 log
-sources. Timestamps are set when you select a sample, so reselect it if it has been sitting a while.
+The "Built-in sample event" dropdown fills the log window with a synthetic event. Its first group,
+"Vendor sample logs", has one event for each of 20 log sources. The groups after it are logs built
+to match correlation rules (see [Correlation rules](#correlation-rules)). Timestamps are set when
+you select a sample, so reselect it if it has been sitting a while.
 Every event contains `NGSIEM-LogTester-TEST`, so this finds them in Advanced Event Search:
 
 ```
@@ -112,28 +126,87 @@ are bare lines. Selecting one switches the send mode to Raw.
 
 ## Correlation rules
 
-The app reads your tenant's configured correlation rules and CrowdStrike's built-in rule templates.
-This needs the **Correlation Rules: Read** scope as well as the data connection scopes. Without it,
-the app still works, but the page shows that rules couldn't be checked.
+The app reads your tenant's configured correlation rules
+(`GET /correlation-rules/combined/rules/v1`) and CrowdStrike's built-in rule templates
+(`/correlation-rules/queries/templates/v1` and `/correlation-rules/entities/templates/v1`). This needs
+the **Correlation Rules: Read** scope. Without it, the app still sends logs, but the page shows that
+rules couldn't be checked, and the forensic log records that the submission wasn't screened.
 
-- **Rule templates in the dropdown:** for each rule a third-party log could trigger, the sample
-  dropdown has a generated log, grouped by vendor and product. Each one starts from that vendor's
-  sample event and is changed to meet the rule's conditions. Rules that need several events get a
-  JSON array with enough of them. Rules over Falcon sensor data get no template.
-- **Live check:** as you edit the log, change the send mode or pick a connector, the page estimates
-  which rules the submission is likely to match. It shows each condition and suggests fixes, such as
-  the raw field to add or change, case mismatches and near-miss field names.
-- **Acknowledgement:** if the submission will probably trigger an enabled configured rule, the
-  app shows those rules grouped by vendor and product. Nothing is sent until you tick the
-  acknowledgement and choose Proceed. The forensic log records which rules you acknowledged.
-  CrowdStrike templates and rules that aren't enabled never fire, so they don't need acknowledgement.
+**Loading:** a tenant can have well over 1,000 templates, so the first load can take 15 seconds or
+more. The vendor samples appear straight away and the rule templates follow. Rules are then cached for
+15 minutes. After changing rules in Falcon, use **Reload rules** in the rule check panel under the
+log window.
+
+### Rule templates in the dropdown
+
+For each rule a third-party log could trigger, the dropdown has a generated log:
+
+- **Grouped by vendor and product,** such as "Okta / Okta SSO". Templates that span several vendors
+  are grouped by their vendor list, as "Multiple sources".
+- **Labelled by source:** configured, configured but not enabled, or CrowdStrike template. A template
+  that one of your configured rules was created from is listed once, as the configured rule.
+- **Built from the vendor's sample event,** changed to meet the rule's conditions. A rule that needs
+  several events gets enough of them, and a source that sends events in batches gets them in its
+  batch format, such as Proofpoint TAP's `{"messagesDelivered": [...]}`.
+- **Rules over Falcon sensor data get no template,** because no third-party log can trigger them.
+
+The note under the dropdown names the rule a template was built for and gives the check's verdict.
+
+### Live check
+
+As you edit the log, change the send mode or pick a connector, the panel under the log window
+estimates which rules the submission would match. Each rule shows one of these verdicts:
+
+| Verdict | Meaning |
+| --- | --- |
+| Likely to match | Every checkable condition is met, including at least one on the log's own fields |
+| Needs more events | Matching events were found, but the rule needs more of them |
+| Can't fully check | Some conditions depend on the parser, or the query uses something the app doesn't evaluate |
+| Unlikely to match | At least one condition isn't met |
+| Not applicable | The rule runs on Falcon sensor data |
+
+The badge summarizes the result: whether enabled rules will probably fire, whether templates would
+match if enabled, or whether nothing is likely to trigger. The panel lists likely matches, rules
+needing more events, your configured rules that can't be fully checked, and the selected template's
+own rule. Other templates that can't be fully checked are only counted, so they don't flood the list.
+
+Each listed rule expands to show its conditions, what the log has, and what each check was based on.
+Suggestions name the raw field to add or change, catch case mismatches and near-miss field names,
+say how many events are still needed, and point out when a source expects a batch format. When a
+rule has `case` branches, suggestions follow the branch closest to passing.
+
+**Which parser is assumed:** the selected connector's parser. With no connector selected, the
+parser the selected sample or template was written for is used instead.
+
+### Acknowledgement
+
+If the submission will probably trigger an enabled configured rule, the app stops before cloning
+anything and shows those rules in a dialog, grouped by vendor and product, each expandable. Nothing is
+sent until you tick the acknowledgement and choose Proceed. Cancel sends nothing. The server enforces
+this too, so a submission that doesn't acknowledge every such rule is refused.
+
+The forensic log records the check and the rules you acknowledged. CrowdStrike templates and rules
+that aren't enabled never fire, so they don't need acknowledgement.
+
+### Limits of the check
 
 **This is an estimate, not NG-SIEM's evaluation.** Rules match on fields the parser produces, such as
-`#Vendor`, `event.action` and `Vendor.*`, and the app only sees the raw log. It assumes the parsing
-standard's `Vendor.` prefix for raw fields, takes `#Vendor` from the selected connector's parser, and
-uses approximate mappings for common ECS fields (`field_model.py`). Conditions it can't check are
-shown as unknown, and constructs such as `correlate()`, `join()` and lookups aren't evaluated. The
-lookback window isn't considered, so earlier events in the tenant may still count toward a threshold.
+`#Vendor`, `event.action` and `Vendor.*`, and the app only sees the raw log. Following CrowdStrike's
+parsing standard, it assumes raw fields appear under a `Vendor.` prefix. It takes `#Vendor` from the
+connector's parser, and assumes standard values for tags such as `#event.kind`. It uses approximate
+mappings for common ECS fields such as `event.action` (see `field_model.py`).
+
+- **Understood:** comparisons, regexes, wildcards, `in()`, `cidr()`, `case { }` branches,
+  `array:contains()`, and event-count thresholds after an aggregation.
+- **Not evaluated:** `correlate()`, `join()`, `defineTable()`, `match()`, lookups and `test()`.
+  Fields only the parser creates show as unknown rather than guessed.
+- **A match on parser tags alone,** such as `#Vendor`, is reported as "can't fully check", because it
+  says nothing about the log.
+- **The lookback window isn't considered,** so earlier events in the tenant may still count toward a
+  threshold.
+- **Coverage in practice:** in live testing against 1,628 rules, 253 needed Falcon sensor data, and
+  most of the rest could only be judged "can't fully check". Treat "Unlikely" and "Can't fully check"
+  as estimates, not guarantees.
 
 ## Pull connectors
 
@@ -185,7 +258,7 @@ submission:
 
 | Event | Contents |
 | --- | --- |
-| `submission_started` | OS user, client address, API client ID, Falcon URL, connector ID, send mode, built-in sample ID if unedited, the full submitted log and its SHA-256 |
+| `submission_started` | OS user, client address, API client ID, Falcon URL, connector ID, send mode, the sample or rule template ID if unedited, the correlation rule check (checked or unavailable, how many rules, and the rules you acknowledged), the full submitted log and its SHA-256 |
 | `source_parser_stored` | Pull connectors only: the source connector ID and its parser |
 | `clone_created` | Clone ID, name, parser, source type, and the catalog connector it was built from |
 | `clone_delete_refused` | Clone details and why the delete limiter refused. Followed by `clone_delete_failed` |
