@@ -40,6 +40,9 @@ On macOS or Linux, use `.venv/bin/python app.py`. Set `PORT` in `.env` to use a 
 | `app.py` | Web routes, and opening and closing forensic records |
 | `workflow.py` | Clone, get credentials, send the log, delete the clone. Timeouts and retries are in `Settings` |
 | `sample_events.py` | The built-in synthetic sample events |
+| `rules.py` | Loading correlation rules, judging a submission against them, and building rule templates |
+| `cql.py` | Reading a rule's CQL query and evaluating its filter against one event |
+| `field_model.py` | The approximation of what each parser gives a rule: tags, `Vendor.` fields and ECS mappings |
 | `falcon_client.py` | Falcon API calls and the masked verbose log |
 | `forensic_log.py` | The append-only log on disk |
 | `templates/index.html` | The operator page |
@@ -106,6 +109,31 @@ samples can only be sent through a connector that uses a parser your tenant has.
 
 **Syslog sources:** Cisco UCS, Cisco Firepower and Epic natively send syslog text, so their samples
 are bare lines. Selecting one switches the send mode to Raw.
+
+## Correlation rules
+
+The app reads your tenant's configured correlation rules and CrowdStrike's built-in rule templates.
+This needs the **Correlation Rules: Read** scope as well as the data connection scopes. Without it,
+the app still works, but the page shows that rules couldn't be checked.
+
+- **Rule templates in the dropdown:** for each rule a third-party log could trigger, the sample
+  dropdown has a generated log, grouped by vendor and product. Each one starts from that vendor's
+  sample event and is changed to meet the rule's conditions. Rules that need several events get a
+  JSON array with enough of them. Rules over Falcon sensor data get no template.
+- **Live check:** as you edit the log, change the send mode or pick a connector, the page estimates
+  which rules the submission is likely to match. It shows each condition and suggests fixes, such as
+  the raw field to add or change, case mismatches and near-miss field names.
+- **Acknowledgement:** if the submission will probably trigger an enabled configured rule, the
+  app shows those rules grouped by vendor and product. Nothing is sent until you tick the
+  acknowledgement and choose Proceed. The forensic log records which rules you acknowledged.
+  CrowdStrike templates and rules that aren't enabled never fire, so they don't need acknowledgement.
+
+**This is an estimate, not NG-SIEM's evaluation.** Rules match on fields the parser produces, such as
+`#Vendor`, `event.action` and `Vendor.*`, and the app only sees the raw log. It assumes the parsing
+standard's `Vendor.` prefix for raw fields, takes `#Vendor` from the selected connector's parser, and
+uses approximate mappings for common ECS fields (`field_model.py`). Conditions it can't check are
+shown as unknown, and constructs such as `correlate()`, `join()` and lookups aren't evaluated. The
+lookback window isn't considered, so earlier events in the tenant may still count toward a threshold.
 
 ## Pull connectors
 

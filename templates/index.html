@@ -9,11 +9,13 @@
     --bg: #f5f6f8; --panel: #fff; --text: #1c2128; --muted: #5d6673; --line: #d5dae1;
     --accent: #c8102e; --accent-text: #fff; --code-bg: #14181f; --code-text: #e6e9ef;
     --ok: #17663a; --ok-bg: #e5f5ec; --bad: #a3141f; --bad-bg: #fcebec;
+    --warn: #7a4b00; --warn-bg: #fdf3dc;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #12151a; --panel: #1b2027; --text: #e6e9ef; --muted: #9aa4b2; --line: #333b47;
       --accent: #e0334c; --ok: #6fd69b; --ok-bg: #15301f; --bad: #ff9098; --bad-bg: #3a1a1e;
+      --warn: #f3c46b; --warn-bg: #352812;
     }
   }
   * { box-sizing: border-box; }
@@ -53,6 +55,29 @@
   .entry.error .title { color: var(--bad); font-weight: 600; }
   .title { overflow-wrap: anywhere; }
   pre { margin: 6px 0 0; padding: 8px 10px; background: var(--code-bg); color: var(--code-text); border-radius: 4px; overflow-x: auto; font: 12px/1.45 ui-monospace, Consolas, monospace; }
+  .rulecheck { margin-top: 12px; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
+  .rulecheck-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 14px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 13px; font-weight: 600; }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .badge.bad { background: var(--bad-bg); color: var(--bad); }
+  .badge.muted { background: var(--bg); color: var(--muted); }
+  button.link { border: 0; background: none; padding: 0; color: var(--muted); text-decoration: underline; font-weight: 400; font-size: 13px; }
+  .rule { border-top: 1px solid var(--line); padding: 8px 0 0; margin-top: 8px; font-size: 14px; }
+  .rule summary { font-weight: 600; }
+  .rule .meta { color: var(--muted); font-size: 13px; }
+  .rule ul { margin: 6px 0 0; padding-left: 20px; }
+  .conditions { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 12px; }
+  .conditions th, .conditions td { text-align: left; padding: 3px 6px; border-top: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+  .conditions code { font-family: ui-monospace, Consolas, monospace; }
+  .table-wrap { overflow-x: auto; }
+  .group > summary { font-size: 14px; }
+  dialog { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); padding: 20px; width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 32px); }
+  dialog::backdrop { background: rgba(0, 0, 0, .5); }
+  dialog h2 { font-size: 18px; margin: 0 0 8px; }
+  .check { display: flex; gap: 8px; align-items: flex-start; font-weight: 600; margin-top: 16px; }
+  .check input { margin-top: 4px; }
+  .end { justify-content: flex-end; margin-top: 16px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -84,6 +109,15 @@
     <label for="log" class="below">Raw log</label>
     <textarea id="log" spellcheck="false" placeholder='{ "timestamp": "2026-11-01T12:00:00Z", "message": "example" }'></textarea>
     <p class="hint" id="log-hint"></p>
+    <div class="rulecheck" id="rule-check" aria-live="polite" hidden>
+      <div class="rulecheck-head">
+        <strong>Correlation rule check</strong>
+        <span class="badge muted" id="rule-badge">Checking...</span>
+        <button id="rules-refresh" type="button" class="link">Reload rules</button>
+      </div>
+      <p class="hint" id="rule-summary"></p>
+      <div id="rule-groups"></div>
+    </div>
     <div class="actions">
       <div>
         <label for="mode">Send as</label>
@@ -108,12 +142,161 @@
   </section>
 </main>
 
+<dialog id="ack-dialog" aria-labelledby="ack-title">
+  <h2 id="ack-title">Correlation rules will probably fire</h2>
+  <p>Sending this log will probably trigger these configured rules in your tenant. They may raise detections, open cases or send notifications.</p>
+  <div id="ack-groups"></div>
+  <label class="check"><input type="checkbox" id="ack-box"> I acknowledge that these correlation rules will probably fire.</label>
+  <div class="row end">
+    <button id="ack-cancel" type="button">Cancel</button>
+    <button id="ack-proceed" type="button" class="primary" disabled>Proceed</button>
+  </div>
+</dialog>
+
 <script>
   const $ = (id) => document.getElementById(id);
   const connectorSelect = $("connector"), logInput = $("log"), submitButton = $("submit");
   const sampleSelect = $("sample");
   let selected = null, busy = false, selectionRequest = 0;
   let samples = [], loadedSampleText = null, previousSampleId = "", sampleRequest = 0, rawChosenForSample = false;
+  let checkTimer = null, checkRequest = 0, pendingAcknowledgement = [];
+
+  function el(tag, props = {}, children = []) {
+    const node = document.createElement(tag);
+    Object.assign(node, props);
+    node.append(...children.filter((child) => child !== null && child !== undefined));
+    return node;
+  }
+
+  const VERDICTS = {
+    likely: "Likely to match",
+    needs_more_events: "Needs more events",
+    uncertain: "Can't fully check",
+    unlikely: "Unlikely to match",
+    not_applicable: "Not applicable",
+  };
+
+  function sourceLabel(rule) {
+    if (rule.source === "template") return "CrowdStrike template, not enabled";
+    return rule.enabled ? "Configured, enabled" : "Configured, not enabled";
+  }
+
+  function ruleDetails(rule, open = false) {
+    const conditionRows = (rule.conditions || []).map((c) => el("tr", {}, [
+      el("td", {}, [el("code", { textContent: c.field })]),
+      el("td", { textContent: `${c.op} ${c.expected}` }),
+      el("td", { textContent: c.actual === null || c.actual === undefined ? "(none)" : String(c.actual) }),
+      el("td", { textContent: c.met }),
+      el("td", { textContent: c.basis }),
+    ]));
+    const table = conditionRows.length ? el("div", { className: "table-wrap" }, [el("table", { className: "conditions" }, [
+      el("thead", {}, [el("tr", {}, ["Field", "Rule wants", "Log has", "Met", "Based on"].map((h) => el("th", { textContent: h })))]),
+      el("tbody", {}, conditionRows),
+    ])]) : null;
+    const suggestions = (rule.suggestions || []).length
+      ? el("div", {}, [el("strong", { textContent: "Suggestions" }), el("ul", {}, rule.suggestions.map((s) => el("li", { textContent: s })))])
+      : null;
+    const severity = rule.severity !== null && rule.severity !== undefined ? `. Severity ${rule.severity}` : "";
+    return el("details", { className: "rule", open }, [
+      el("summary", { textContent: `${rule.name}: ${VERDICTS[rule.verdict] || rule.verdict}` }),
+      el("div", { className: "meta", textContent: `${sourceLabel(rule)}${severity}. ${rule.summary || ""}` }),
+      suggestions,
+      table,
+    ]);
+  }
+
+  function groupList(groups, openSingle) {
+    return groups.map((g) => el("details", { className: "group", open: openSingle && groups.length === 1 }, [
+      el("summary", { textContent: `${g.group} (${g.rules.length} rule${g.rules.length === 1 ? "" : "s"})` }),
+      ...g.rules.map((rule) => ruleDetails(rule)),
+    ]));
+  }
+
+  function scheduleCheck() {
+    clearTimeout(checkTimer);
+    checkTimer = setTimeout(runCheck, 400);
+  }
+
+  async function runCheck() {
+    const request = ++checkRequest;
+    const panel = $("rule-check");
+    if (!logInput.value.trim()) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    const data = await callApi("/api/evaluate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        log: logInput.value,
+        mode: $("mode").value,
+        connector_id: selected ? selected.id : null,
+        sample_id: sampleSelect.value || null,
+      }),
+    });
+    if (request !== checkRequest) return;
+    showCheck(data);
+  }
+
+  function showCheck(data) {
+    const badge = $("rule-badge");
+    const summary = $("rule-summary");
+    if (!data.success) {
+      badge.className = "badge warn";
+      badge.textContent = "Couldn't check";
+      summary.textContent = data.message || "The rule check failed.";
+      $("rule-groups").replaceChildren();
+      return;
+    }
+    const all = data.groups.flatMap((g) => g.rules);
+    const firing = data.will_fire.flatMap((g) => g.rules);
+    const wouldMatch = all.filter((r) => r.verdict === "likely" && !(r.source === "configured" && r.enabled));
+    const unsure = all.filter((r) => r.verdict === "uncertain" && (r.source === "configured" || r.key === selectedRule));
+    const selectedRule = (samples.find((s) => s.id === sampleSelect.value) || {}).rule_key;
+    if (firing.length) {
+      badge.className = "badge bad";
+      badge.textContent = `Will probably trigger ${firing.length} rule${firing.length === 1 ? "" : "s"}`;
+    } else if (wouldMatch.length) {
+      badge.className = "badge warn";
+      badge.textContent = `Would match ${wouldMatch.length} rule${wouldMatch.length === 1 ? "" : "s"} if enabled`;
+    } else if (all.some((r) => r.verdict === "needs_more_events")) {
+      badge.className = "badge warn";
+      badge.textContent = "Needs more events to trigger a rule";
+    } else if (unsure.length) {
+      badge.className = "badge warn";
+      badge.textContent = "Can't fully check";
+    } else {
+      badge.className = "badge ok";
+      badge.textContent = "Not likely to trigger a rule";
+    }
+    const parts = [];
+    if (!data.rules_available) parts.push(`Some rules couldn't be loaded: ${data.message}`);
+    parts.push(`Checked ${data.events} event${data.events === 1 ? "" : "s"} against ${data.rule_count} rule${data.rule_count === 1 ? "" : "s"}.`);
+    if (!selected) parts.push("Select a connector for a sharper check, because parsers decide some fields.");
+    parts.push("This is an estimate from the raw log, not NG-SIEM's own evaluation.");
+    summary.textContent = parts.join(" ");
+    // Show rules worth attention: likely or close matches, your configured rules that can't be fully
+    // checked, and the rule a selected template was built for. Templates that can't be checked are counted.
+    const worth = (r) => ["likely", "needs_more_events"].includes(r.verdict)
+      || (r.verdict === "uncertain" && r.source === "configured")
+      || r.key === selectedRule;
+    const hidden = all.filter((r) => r.verdict === "uncertain" && !worth(r)).length;
+    if (hidden) summary.textContent += ` ${hidden} CrowdStrike template${hidden === 1 ? "" : "s"} can't be fully checked and aren't listed.`;
+    const shown = data.groups
+      .map((g) => ({ group: g.group, rules: g.rules.filter(worth) }))
+      .filter((g) => g.rules.length)
+      .sort((a, b) => Number(b.rules.some((r) => r.key === selectedRule)) - Number(a.rules.some((r) => r.key === selectedRule)));
+    $("rule-groups").replaceChildren(...groupList(shown, true));
+  }
+
+  function openAcknowledgement(groups) {
+    pendingAcknowledgement = groups.flatMap((g) => g.rules.map((r) => r.key));
+    $("ack-groups").replaceChildren(...groupList(groups, true));
+    $("ack-box").checked = false;
+    $("ack-proceed").disabled = true;
+    $("ack-dialog").showModal();
+  }
 
   function parseInput() {
     const text = logInput.value;
@@ -249,18 +432,54 @@
     $("details").hidden = false;
     $("pull-note").hidden = selected.section !== "pull";
     refreshControls();
+    scheduleCheck();
   }
 
-  async function loadSamples() {
+  async function loadSamples(refresh = false) {
+    const previous = sampleSelect.value;
+    // Vendor samples are instant. Rule templates can take a while the first time, so they follow.
+    const ruleRequest = callApi(`/api/rule-templates${refresh ? "?refresh=1" : ""}`);
     const data = await callApi("/api/sample-events");
-    if (!data.success) return;
-    samples = data.samples;
-    for (const sample of samples) sampleSelect.add(new Option(sample.label, sample.id));
+    sampleSelect.replaceChildren(new Option("None: I'll paste my own log", ""));
+    samples = data.success ? data.samples : [];
+    if (samples.length) {
+      sampleSelect.append(el("optgroup", { label: "Vendor sample logs" }, samples.map((s) => new Option(s.label, s.id))));
+    }
+    const loading = new Option("Loading correlation rule templates...", "");
+    loading.disabled = true;
+    sampleSelect.append(loading);
+    if (samples.some((s) => s.id === previous)) sampleSelect.value = previous;
+    const ruleData = await ruleRequest;
+    loading.remove();
+    if (!ruleData.success && !(ruleData.templates || []).length) {
+      const failed = new Option(`Correlation rule templates unavailable: ${ruleData.message || "unknown error"}`, "");
+      failed.disabled = true;
+      sampleSelect.append(failed);
+    }
+    const templates = (ruleData.templates || []).map((t) => ({ ...t, format: "json" }));
+    samples = samples.concat(templates);
+    const groups = {};
+    for (const t of templates) (groups[t.group] = groups[t.group] || []).push(t);
+    for (const [name, items] of Object.entries(groups)) {
+      sampleSelect.append(el("optgroup", { label: `${name}: correlation rules` }, items.map((t) => {
+        const tag = t.rule_source === "template" ? "template" : t.enabled ? "configured" : "configured, not enabled";
+        return new Option(`${t.label} (${tag})`, t.id);
+      })));
+    }
+    if (samples.some((s) => s.id === previous)) sampleSelect.value = previous;
   }
 
   function showSampleNote(sample) {
     $("sample-note").hidden = !sample;
     if (!sample) return;
+    if (sample.rule_key) {
+      const verdict = VERDICTS[sample.verdict] || sample.verdict;
+      const kind = sample.rule_source === "template" ? "CrowdStrike rule template" : sample.enabled ? "enabled rule in your tenant" : "rule in your tenant that isn't enabled";
+      $("sample-note-text").textContent = `Built to match the ${kind} "${sample.label}". Built-in check: ${verdict}. ${sample.note || ""}`;
+      $("sample-source").hidden = true;
+      return;
+    }
+    $("sample-source").hidden = false;
     const accuracy = {
       documented: "Format: documented by the vendor.",
       partial: "Format: partly documented.",
@@ -303,9 +522,10 @@
       rawChosenForSample = false;
     }
     refreshControls();
+    scheduleCheck();
   }
 
-  async function submitLog() {
+  async function submitLog(acknowledged = []) {
     busy = true;
     const label = submitButton.textContent;
     submitButton.textContent = "Cloning and sending (this can take a few minutes)...";
@@ -320,23 +540,44 @@
         mode: $("mode").value,
         // Only an unedited sample counts as that sample in the forensic log.
         sample_id: logInput.value === loadedSampleText ? sampleSelect.value : null,
+        acknowledged_rules: acknowledged,
       }),
     });
     busy = false;
     submitButton.textContent = label;
-    showResult(data.success, data.message, data.log);
     refreshControls();
+    if (data.needs_acknowledgement) {
+      openAcknowledgement(data.will_fire);
+      return;
+    }
+    showResult(data.success, data.message, data.log);
   }
 
   sampleSelect.addEventListener("change", selectSample);
   $("mode").addEventListener("change", () => {
     rawChosenForSample = false;
     refreshControls();
+    scheduleCheck();
+  });
+  $("rules-refresh").addEventListener("click", async () => {
+    await callApi("/api/rules?refresh=1");
+    await loadSamples(true);
+    runCheck();
+  });
+  $("ack-box").addEventListener("change", () => { $("ack-proceed").disabled = !$("ack-box").checked; });
+  $("ack-cancel").addEventListener("click", () => {
+    $("ack-dialog").close();
+    showResult(false, "Cancelled. Nothing was cloned or sent.", []);
+  });
+  $("ack-proceed").addEventListener("click", () => {
+    if (!$("ack-box").checked) return;
+    $("ack-dialog").close();
+    submitLog(pendingAcknowledgement);
   });
   connectorSelect.addEventListener("change", selectConnector);
   $("refresh").addEventListener("click", loadConnectors);
-  logInput.addEventListener("input", refreshControls);
-  submitButton.addEventListener("click", submitLog);
+  logInput.addEventListener("input", () => { refreshControls(); scheduleCheck(); });
+  submitButton.addEventListener("click", () => submitLog());
   $("format").addEventListener("click", () => {
     const parsed = parseInput();
     if (parsed.value !== undefined) logInput.value = JSON.stringify(parsed.value, null, 2);

@@ -234,6 +234,46 @@ class FalconClient:
         with self._lock:
             del self._created_clones[connection_id]
 
+    def list_correlation_rules(self, log):
+        """Every configured correlation rule version. Needs the Correlation Rules: Read scope."""
+        items, offset = [], 0
+        while True:
+            response = self.request("GET", "/correlation-rules/combined/rules/v1", log,
+                                    params={"limit": 500, "offset": offset})
+            if not response.ok:
+                raise FalconError(f"Could not read correlation rules: {api_errors(response)}")
+            payload = response.json()
+            page = payload.get("resources") or []
+            items.extend(page)
+            offset += len(page)
+            total = ((payload.get("meta") or {}).get("pagination") or {}).get("total")
+            if not page or (total is not None and offset >= total) or (total is None and len(page) < 500):
+                return items
+
+    def list_correlation_rule_templates(self, log):
+        """CrowdStrike's built-in correlation rule templates."""
+        ids, offset = [], 0
+        while True:
+            response = self.request("GET", "/correlation-rules/queries/templates/v1", log,
+                                    params={"limit": 100, "offset": offset})
+            if not response.ok:
+                raise FalconError(f"Could not list correlation rule templates: {api_errors(response)}")
+            payload = response.json()
+            page = payload.get("resources") or []
+            ids.extend(page)
+            offset += len(page)
+            total = ((payload.get("meta") or {}).get("pagination") or {}).get("total")
+            if not page or (total is not None and offset >= total) or (total is None and len(page) < 100):
+                break
+        templates = []
+        for start in range(0, len(ids), 100):
+            response = self.request("GET", "/correlation-rules/entities/templates/v1", log,
+                                    params={"ids": ids[start:start + 100]})
+            if not response.ok:
+                raise FalconError(f"Could not read correlation rule templates: {api_errors(response)}")
+            templates.extend(response.json().get("resources") or [])
+        return templates
+
     def get_ingest_token(self, connection_id, log):
         return self.request("GET", "/ngsiem/entities/connections/token/v1", log, params={"ids": connection_id})
 
