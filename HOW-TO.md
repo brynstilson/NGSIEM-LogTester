@@ -44,7 +44,19 @@ Edit `.env` and set `FALCON_CLIENT_ID`, `FALCON_CLIENT_SECRET` and `FALCON_BASE_
 .venv\Scripts\python.exe app.py
 ```
 
-The app has no login of its own and acts with the API client's rights, so it only listens on this computer (127.0.0.1).
+The app has no login of its own and acts with the API client's rights, so by default it only listens on this computer (127.0.0.1).
+
+**Running the app on a server and browsing from another machine:**
+1. In the server's `.env`, set `HOST=0.0.0.0`, and set `APP_ADMIN_PASSWORD`.
+2. Allow the port through the server's firewall, for your workstation's IP address only. For example:
+   `sudo ufw allow from <workstation-ip> to any port 5000 proto tcp`
+3. Restart the app. It prints a warning that it is reachable from other machines; that's expected.
+4. On the workstation, browse to `http://<server-address>:5000`.
+
+The alternative is to leave `HOST` alone and use an SSH tunnel from the workstation:
+`ssh -L 5000:127.0.0.1:5000 user@server`, then browse to http://127.0.0.1:5000.
+
+For more detail, see [Running on a server](README.md#running-on-a-server-clientserver) in the README.
 
 ---
 
@@ -233,3 +245,5 @@ Settings are stored locally in `app_settings.json` and `branding/`. Git ignores 
 | A warning that the clone wasn't deleted | Delete the named clone in Falcon under Data connectors |
 | A settings save is refused | Enter the `APP_ADMIN_PASSWORD` from `.env` |
 | Port 5000 is already in use | Set `PORT=5050` (or another free port) in `.env` and restart |
+| Can't connect from another machine | Set `HOST=0.0.0.0` in `.env`, open the port in the server's firewall, and restart (see "Before you start") |
+| Still can't connect after setting `HOST` | Check that the startup output says `Running on all addresses`, test with `curl http://127.0.0.1:5000` on the server, then check the firewall, including any cloud security group |

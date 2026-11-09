@@ -77,8 +77,26 @@ To try the page without a tenant, run `python tests/mock_falcon.py` in one termi
 `FALCON_BASE_URL=http://127.0.0.1:9000`, any client ID and secret, and a separate
 `FORENSIC_LOG_PATH` in `.env`, so that mock runs stay out of your real forensic log.
 
-The app has no login and acts with the API client's rights, so it only listens on localhost. Put
-real authentication in front of it before sharing it with other operators.
+### Running on a server (client/server)
+
+The app has no login and acts with the API client's rights, so by default it only listens on
+localhost (`HOST=127.0.0.1`). To reach it from another machine, choose one of these:
+
+- **SSH tunnel (no change needed).** From the workstation, run
+  `ssh -L 5000:127.0.0.1:5000 user@server`, then browse to http://127.0.0.1:5000.
+- **Listen on the network.** Set `HOST=0.0.0.0` in the server's `.env` and restart the app. Then
+  browse to `http://<server-address>:5000`. You'll also need to:
+  - open the port in the server's firewall, only for the workstations that need it. For example:
+    `sudo ufw allow from <workstation-ip> to any port 5000 proto tcp`, or
+    `sudo firewall-cmd --add-rich-rule='rule family=ipv4 source address=<workstation-ip> port port=5000 protocol=tcp accept' --permanent`
+    followed by `sudo firewall-cmd --reload`;
+  - set `APP_ADMIN_PASSWORD`, so that only administrators can change the settings.
+
+  At startup, the app prints a warning whenever it listens beyond localhost.
+  Traffic is plain HTTP, so use this only on a trusted network for testing.
+
+Before sharing the app with other operators permanently, put real authentication and HTTPS in front
+of it, for example a reverse proxy with single sign-on.
 
 ## What it does
 
