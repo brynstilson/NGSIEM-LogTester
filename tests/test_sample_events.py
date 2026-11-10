@@ -119,6 +119,10 @@ def web(tmp_path):
         ingest_ready_wait_seconds=0.01, cleanup_retry_seconds=0.01,
     )
     client = FalconClient("id", "secret", "http://127.0.0.1:1", timeout=1)
+    # The connector must exist before anything is recorded; sending to it still fails, which is fine here.
+    client.get_connection = lambda connection_id, log: {"id": connection_id, "name": "x", "parser_name": "json",
+                                                         "source_type": "Push", "status": "Active"}
+    client.list_connections = lambda log: [{"id": "x"}]
     return create_app(client, settings, ForensicLog(tmp_path / "forensic.jsonl")), tmp_path / "forensic.jsonl"
 
 

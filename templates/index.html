@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ title }}</title>
-<style>
+<style nonce="{{ csp_nonce }}">
   :root {
     --bg: #f5f6f8; --panel: #fff; --text: #1c2128; --muted: #5d6673; --line: #d5dae1;
     --accent: #c8102e; --accent-text: #fff; --code-bg: #14181f; --code-text: #e6e9ef;
@@ -217,7 +217,7 @@
   </div>
 </dialog>
 
-<script>
+<script nonce="{{ csp_nonce }}">
   const $ = (id) => document.getElementById(id);
   const connectorSelect = $("connector"), logInput = $("log"), submitButton = $("submit");
   const sampleSelect = $("sample");

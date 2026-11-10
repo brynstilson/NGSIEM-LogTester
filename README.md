@@ -79,21 +79,49 @@ To try the page without a tenant, run `python tests/mock_falcon.py` in one termi
 
 ### Running on a server (client/server)
 
-The app has no login and acts with the API client's rights, so by default it only listens on
-localhost (`HOST=127.0.0.1`). To reach it from another machine, choose one of these:
+The app acts with the API client's rights, so by default it only listens on localhost
+(`HOST=127.0.0.1`). To reach it from another machine, choose one of these:
 
 - **SSH tunnel (no change needed).** From the workstation, run
   `ssh -L 5000:127.0.0.1:5000 user@server`, then browse to http://127.0.0.1:5000.
-- **Listen on the network.** Set `HOST=0.0.0.0` in the server's `.env` and restart the app. Then
-  browse to `http://<server-address>:5000`. You'll also need to:
-  - open the port in the server's firewall, only for the workstations that need it. For example:
-    `sudo ufw allow from <workstation-ip> to any port 5000 proto tcp`, or
-    `sudo firewall-cmd --add-rich-rule='rule family=ipv4 source address=<workstation-ip> port port=5000 protocol=tcp accept' --permanent`
-    followed by `sudo firewall-cmd --reload`;
-  - set `APP_ADMIN_PASSWORD`, so that only administrators can change the settings.
+- **Listen on the network.** In the server's `.env`, set all of these, then restart the app:
 
-  At startup, the app prints a warning whenever it listens beyond localhost.
-  Traffic is plain HTTP, so use this only on a trusted network for testing.
+  | Setting | Value |
+  |---|---|
+  | `HOST` | `0.0.0.0` |
+  | `APP_ACCESS_PASSWORD` | The password every operator signs in with |
+  | `APP_ADMIN_PASSWORD` | A different password, for changing the settings |
+  | `APP_ALLOWED_HOSTS` | The address people browse to, such as `10.0.0.5` or `logtester.corp.example` |
+
+  The app refuses to start if any of them is missing. Browse to `http://<server-address>:5000`;
+  the browser asks for a user name and password. Any user name works, and it is recorded in the
+  forensic log as `operator_login`. Open the port in the server's firewall, only for the
+  workstations that need it. For example:
+  `sudo ufw allow from <workstation-ip> to any port 5000 proto tcp`, or
+  `sudo firewall-cmd --add-rich-rule='rule family=ipv4 source address=<workstation-ip> port port=5000 protocol=tcp accept' --permanent`
+  followed by `sudo firewall-cmd --reload`.
+
+  Traffic is plain HTTP, so passwords cross the network unencrypted. Use this only on a trusted
+  network for testing.
+
+**Access protections:**
+- **Host check:** requests addressed to any host name other than localhost, 127.0.0.1 or
+  `APP_ALLOWED_HOSTS` get HTTP 421. This blocks DNS rebinding, where a malicious web page poses as
+  the app in an operator's browser.
+- **Lockout:** 5 wrong operator or administrator passwords from one address within 5 minutes lock
+  that address out for 5 minutes (HTTP 429). Restarting the app clears lockouts. Behind a reverse
+  proxy every user shares the proxy's address, so one person's mistakes can lock everyone out.
+- **Checks before recording:** a submission must name a connector that exists, a valid send mode
+  and a non-empty log before anything is written to the forensic log.
+- **Falcon API limits:** each address may make 30 requests a minute to the routes that call the
+  Falcon API (connectors, connector details, rules, templates and submit). Further requests get HTTP
+  429 with a `Retry-After` header. Connector details are only read for IDs from the latest connector
+  listing; an unknown ID triggers at most one new listing every 30 seconds, so made-up IDs can't
+  drive Falcon API calls or grow the app's cache.
+- **Browser headers:** the page has a strict Content-Security-Policy (only its own script and style,
+  marked with a per-request nonce, may run). Every response tells the browser not to frame the
+  page, not to guess content types, and not to send a referrer. The `Server` header no longer
+  reveals the Werkzeug or Python version.
 
 Before sharing the app with other operators permanently, put real authentication and HTTPS in front
 of it, for example a reverse proxy with single sign-on.

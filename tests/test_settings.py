@@ -168,16 +168,26 @@ def test_the_saved_title_is_in_the_first_paint_and_escaped(web):
     assert "<script>alert(1)</script>" not in html
 
 
+
 def test_listen_address_defaults_to_localhost():
     from app import listen_address
-    assert listen_address({}) == ("127.0.0.1", 5000, [])
-    assert listen_address({"HOST": "", "PORT": ""}) == ("127.0.0.1", 5000, [])
+    assert listen_address({}) == ("127.0.0.1", 5000, [], [])
+    assert listen_address({"HOST": "", "PORT": ""}) == ("127.0.0.1", 5000, [], [])
 
 
-def test_listen_address_warns_when_reachable_from_other_machines():
+def test_listen_address_refuses_network_without_access_controls():
     from app import listen_address
-    host, port, warnings = listen_address({"HOST": "0.0.0.0", "PORT": "8080"})
+    host, port, warnings, errors = listen_address({"HOST": "0.0.0.0", "PORT": "8080"})
     assert (host, port) == ("0.0.0.0", 8080)
-    assert len(warnings) == 2 and "other machines" in warnings[0] and "APP_ADMIN_PASSWORD" in warnings[1]
-    _, _, warnings = listen_address({"HOST": "0.0.0.0", "APP_ADMIN_PASSWORD": "x"})
-    assert len(warnings) == 1
+    assert len(errors) == 3 and not warnings
+    assert all(name in " ".join(errors) for name in ("APP_ACCESS_PASSWORD", "APP_ADMIN_PASSWORD", "APP_ALLOWED_HOSTS"))
+    _, _, _, errors = listen_address({"HOST": "0.0.0.0", "APP_ACCESS_PASSWORD": "same", "APP_ADMIN_PASSWORD": "same",
+                                      "APP_ALLOWED_HOSTS": "10.0.0.5"})
+    assert errors == ["APP_ACCESS_PASSWORD and APP_ADMIN_PASSWORD must be different."]
+
+
+def test_listen_address_allows_network_with_access_controls():
+    from app import listen_address
+    _, _, warnings, errors = listen_address({"HOST": "0.0.0.0", "APP_ACCESS_PASSWORD": "a", "APP_ADMIN_PASSWORD": "b",
+                                             "APP_ALLOWED_HOSTS": "10.0.0.5"})
+    assert errors == [] and len(warnings) == 1 and "plain HTTP" in warnings[0]
