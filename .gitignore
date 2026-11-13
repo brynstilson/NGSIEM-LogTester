@@ -6,3 +6,4 @@ __pycache__/
 .pytest_cache/
 app_settings.json
 branding/
+cache/

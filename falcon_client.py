@@ -274,6 +274,55 @@ class FalconClient:
             templates.extend(response.json().get("resources") or [])
         return templates
 
+    def list_parsers(self, log, repository="parsers-repository"):
+        """Every NG-SIEM parser: name, ID with version, vendor and product. Needs NGSIEM Parsers: Read."""
+        items, offset = [], 0
+        while True:
+            response = self.request("GET", "/ngsiem-content/queries/parsers/v1", log,
+                                    params={"limit": 100, "offset": offset, "repository": repository})
+            if not response.ok:
+                raise FalconError(f"Could not list parsers: {api_errors(response)}")
+            payload = response.json()
+            page = payload.get("resources") or []
+            items.extend(page)
+            offset += len(page)
+            total = ((payload.get("meta") or {}).get("pagination") or {}).get("total")
+            if not page or (total is not None and offset >= total) or (total is None and len(page) < 100):
+                return items
+
+    def get_parser_template(self, parser_id, log, repository="parsers-repository"):
+        """One parser's definition as YAML text. parser_id is the full ID:version form."""
+        response = self.request("GET", "/ngsiem-content/entities/parsers-template/v1", log,
+                                params={"ids": [parser_id], "repository": repository})
+        if not response.ok:
+            raise FalconError(f"Could not read parser {parser_id}: {api_errors(response)}")
+        resource = first_resource(response.json())
+        if not isinstance(resource, dict) or not resource.get("yaml_template"):
+            raise FalconError(f"Parser {parser_id} has no definition.")
+        return resource
+
+    def start_search(self, repository, query, start, log, end="now"):
+        """Start an NG-SIEM search job and return its ID. Needs the NGSIEM: Write scope."""
+        response = self.request("POST", f"/humio/api/v1/repositories/{repository}/queryjobs", log,
+                                body={"queryString": query, "start": start, "end": end, "isLive": False})
+        if response.status_code == 403:
+            raise FalconError("NG-SIEM search isn't allowed for this API client. Add the NGSIEM: Write scope "
+                              "(it covers starting searches) to verify submissions.")
+        if not response.ok:
+            raise FalconError(f"Could not start an NG-SIEM search: {api_errors(response)}")
+        job = response.json()
+        job_id = job.get("id") or (first_resource(job) or {}).get("id")
+        if not job_id:
+            raise FalconError("NG-SIEM didn't return a search job ID.")
+        return job_id
+
+    def get_search(self, repository, job_id, log):
+        """One poll of an NG-SIEM search job: {"done": bool, "events": [...]}."""
+        response = self.request("GET", f"/humio/api/v1/repositories/{repository}/queryjobs/{job_id}", log)
+        if not response.ok:
+            raise FalconError(f"Could not read NG-SIEM search results: {api_errors(response)}")
+        return response.json()
+
     def get_ingest_token(self, connection_id, log):
         return self.request("GET", "/ngsiem/entities/connections/token/v1", log, params={"ids": connection_id})
 

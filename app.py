@@ -6,6 +6,8 @@ import secrets
 import threading
 import time
 import uuid
+from collections import OrderedDict
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from flask import Flask, g, jsonify, render_template, request, send_file
@@ -17,7 +19,10 @@ from security import LOOPBACK_NAMES, RateLimiter, Throttle, host_allowed, parse_
 from falcon_client import ActivityLog, FalconClient, FalconError
 from forensic_log import ForensicLog
 from field_model import PROFILES
-from rules import RuleBook, evaluate, group, rule_templates, template_entry
+from parsers import ParserStore
+from rules import RuleBook, evaluate, events_of, group, judge, raw_of, refresh_minutes_from, rule_templates, template_entry
+from simulation import Simulation
+from verify import verify
 from sample_events import SAMPLE_IDS, list_samples, render_sample
 from workflow import MODE_EVENT, MODE_RAW, Settings, connector_section, is_pull, submit_log
 
@@ -36,15 +41,18 @@ def _summary(connection):
 
 
 MAX_CONNECTOR_ID = 200
+SUBMIT_RULES_MAX_AGE = 60        # seconds: configured rules older than this are re-read at submit
 FALCON_REQUESTS_PER_MINUTE = 30   # per client address, for the routes that call the Falcon API
 CONNECTOR_LIST_MIN_AGE = 30       # seconds before an unknown connector ID may trigger a new listing
 
 # Routes that call the Falcon API. /api/evaluate isn't here: it only uses cached rules and connectors.
-FALCON_ROUTES = {"list_connectors", "select_connector", "list_rules", "list_rule_templates", "submit"}
+FALCON_ROUTES = {"list_connectors", "select_connector", "list_rules", "list_rule_templates", "submit", "verify_submission"}
+RECENT_SUBMISSIONS = 50  # kept in memory so they can be verified in NG-SIEM afterwards
 
 
 def create_app(client=None, settings=None, forensic=None, app_settings=None, admin_password=None,
-               access_password=None, allowed_hosts=None, throttle=None, rate_limiter=None, clock=time.monotonic):
+               access_password=None, allowed_hosts=None, throttle=None, rate_limiter=None, clock=time.monotonic,
+               rule_refresh_minutes=None, simulation=None):
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
     app_settings = app_settings or AppSettings()
@@ -66,7 +74,25 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
         os.environ.get("FALCON_BASE_URL", "https://api.crowdstrike.com"),
     )
     selected = {}  # connection ID -> details read when the operator selected it
-    rulebook = RuleBook(client)
+    if rule_refresh_minutes is None:
+        rule_refresh_minutes = refresh_minutes_from(os.environ.get("RULE_REFRESH_MINUTES"))
+    rulebook = RuleBook(client, rule_refresh_minutes)
+    app.extensions["rulebook"] = rulebook
+    # Runs each connector's real parser (read live with NGSIEM Parsers: Read) to predict the parsed
+    # event. Without that scope or with PARSER_SIMULATION=off, the approximate field mappings are used.
+    if simulation is None:
+        off = str(os.environ.get("PARSER_SIMULATION", "on")).lower() in ("off", "0", "false", "no")
+        simulation = Simulation(None if off else ParserStore(client))
+    app.extensions["simulation"] = simulation
+    template_cache = {}
+    submissions = OrderedDict()  # submission ID -> what's needed to verify it later
+
+    def entry_for(rule):
+        """The generated sample for one rule, built once per rule version."""
+        key = (rule["key"], rule["query"], rule["enabled"])
+        if key not in template_cache:
+            template_cache[key] = template_entry(rule, simulation)
+        return template_cache[key]
 
     def public(rule):
         return {key: value for key, value in rule.items() if not key.startswith("_")}
@@ -178,15 +204,38 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
             return None
         if sample_id.startswith("rule:"):
             rule = rulebook.find(sample_id[len("rule:"):])
-            return rule["parser"] if rule else None
+            entry = entry_for(rule) if rule else None
+            return (entry or {}).get("parser") or (rule["parser"] if rule else None)
         return next((key for key, profile in PROFILES.items() if profile.get("sample") == sample_id), None)
 
-    def rule_check(text, mode, connection_id, log, sample_id=None, include_templates=False):
+    def rule_check(text, mode, connection_id, log, sample_id=None, include_templates=False, max_age=None):
         """Judge a submission against configured rules, and templates too if the operator loaded them."""
-        rules, error = rulebook.load(log, include_templates=include_templates)
+        rules, error = rulebook.load(log, include_templates=include_templates, max_age=max_age)
         parser = parser_for(connection_id, log) or sample_parser(sample_id)
-        checked = evaluate(rules, text, mode, parser)
+        checked = evaluate(rules, text, mode, parser, simulation)
+        checked["parser"] = parser
         return rules, checked, error
+
+    def simulation_summary(text, mode, parser):
+        """The simulated parsed event(s) for the page's information icon, or None."""
+        if not parser or not simulation.active:
+            return None
+        doc = simulation.parser(parser)
+        if not doc:
+            return {"available": False, "parser": parser,
+                    "message": "The parser couldn't be read, so field names are approximate. "
+                               "Check that the API client has the NGSIEM Parsers: Read scope."}
+        events = []
+        for event in events_of(text, mode)[:5]:
+            result = simulation.run(parser, raw_of(event))
+            if result is None:
+                continue
+            fields = {k: v for k, v in sorted(result.fields.items()) if k != "@rawstring"}
+            tags = {f"#{t}": result.fields[t] for t in result.tag_fields if t in result.fields}
+            events.append({"dropped": result.dropped, "tags": tags, "fields": dict(list(fields.items())[:400]),
+                           "unknown": sorted(result.unknown), "unsupported": result.unsupported,
+                           "error": result.error, "approximate": result.approximate})
+        return {"available": True, "parser": doc["name"], "version": doc["version"], "events": events}
 
     def wants_templates():
         return request.args.get("templates") == "1"
@@ -194,7 +243,13 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
     @app.get("/")
     def index():
         # The saved title goes in the first paint, so the default never flashes up.
-        return render_template("index.html", title=app_settings.read()["title"], csp_nonce=g.csp_nonce)
+        return render_template("index.html", title=app_settings.read()["title"], csp_nonce=g.csp_nonce,
+                               rule_refresh_minutes=rulebook.refresh_minutes)
+
+    @app.get("/api/rules/status")
+    def rules_status():
+        # Cheap: no Falcon call. The page polls this and reloads its rule samples when the version changes.
+        return jsonify(success=True, **rulebook.status())
 
     def settings_payload():
         values = app_settings.read()
@@ -321,7 +376,7 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
     def list_rule_templates():
         log = ActivityLog()
         rules, error = rulebook.load(log, refresh=request.args.get("refresh") == "1", include_templates=wants_templates())
-        entries = rule_templates(rules)
+        entries = rule_templates(rules, simulation, template_cache)
         return jsonify(success=error is None, message=error, templates_loaded=rulebook.templates_loaded(),
                        templates=[{k: v for k, v in entry.items() if k != "log"} for entry in entries])
 
@@ -342,16 +397,19 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
             events=checked["events"],
             groups=group(checked["results"]),
             will_fire=group(checked["will_fire"]),
+            simulation=simulation_summary(text, data.get("mode", MODE_EVENT), checked.get("parser")),
         )
 
     @app.get("/api/sample-events/<sample_id>")
     def sample_event(sample_id):
         if sample_id.startswith("rule:"):
             rule = rulebook.find(sample_id[len("rule:"):])
-            entry = template_entry(rule) if rule else None
+            entry = entry_for(rule) if rule else None
             if entry is None:
                 return jsonify(success=False, message=f"Unknown rule template: {sample_id}"), 404
-            return jsonify(success=True, log=entry["log"], note=entry["note"], verdict=entry["verdict"])
+            return jsonify(success=True, log=entry["log"], note=entry["note"], verdict=entry["verdict"],
+                           parser=entry.get("parser"), reasons=entry.get("reasons", []),
+                           incomplete=entry.get("incomplete", False), simulated=entry.get("simulated", False))
         text = render_sample(sample_id)
         if text is None:
             return jsonify(success=False, message=f"Unknown sample event: {sample_id}"), 404
@@ -384,7 +442,8 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
 
         # Configured rules this submission would probably fire must be acknowledged first. Templates
         # never fire, so they aren't loaded for this.
-        rules, checked, rule_error = rule_check(text, mode, connection_id, log)
+        # Rules are re-read if the stored copy is over a minute old, so a rule just enabled in Falcon is checked.
+        rules, checked, rule_error = rule_check(text, mode, connection_id, log, max_age=SUBMIT_RULES_MAX_AGE)
         firing = checked["will_fire"]
         acknowledged = data.get("acknowledged_rules") if isinstance(data.get("acknowledged_rules"), list) else []
         unacknowledged = [rule for rule in firing if rule["key"] not in acknowledged]
@@ -477,7 +536,43 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
         )
         if unwritten:
             message += f" WARNING: the forensic log is incomplete, missing: {', '.join(unwritten)}."
-        return jsonify(success=success, message=message, submission_id=submission_id, clone=clone, log=log.entries)
+        if success:
+            flagged = [r["key"] for r in checked["results"] if r["verdict"] in ("likely", "uncertain", "needs_more_events")]
+            if sample_id and sample_id.startswith("rule:"):
+                flagged.append(sample_id[len("rule:"):])
+            submissions[submission_id] = {"time": datetime.now(timezone.utc), "text": text, "mode": mode,
+                                          "parser": (connection or {}).get("parser_name"), "rule_keys": list(dict.fromkeys(flagged))}
+            while len(submissions) > RECENT_SUBMISSIONS:
+                submissions.popitem(last=False)
+        return jsonify(success=success, message=message, submission_id=submission_id, clone=clone, log=log.entries,
+                       verifiable=success)
+
+    @app.post("/api/verify")
+    def verify_submission():
+        """Find a submission's events in NG-SIEM and check the rules against NG-SIEM's own parsing."""
+        data = request.get_json(silent=True)
+        if not request.is_json or not isinstance(data, dict):
+            return jsonify(success=False, message="Expected a JSON request."), 415
+        submission_id = data.get("submission_id")
+        submission = submissions.get(submission_id) if isinstance(submission_id, str) else None
+        if submission is None:
+            return jsonify(success=False, message="That submission isn't available to verify. Only recent submissions "
+                                                  "made since the app started can be verified."), 404
+        log = ActivityLog()
+        rules, _ = rulebook.load(log, include_templates=rulebook.templates_loaded())
+        wanted = [r for r in rules if r["key"] in submission["rule_keys"]]
+        try:
+            outcome = verify(client, submission, wanted, simulation, judge, log)
+        except FalconError as exc:
+            outcome = {"success": False, "message": str(exc)}
+        try:
+            forensic.write("submission_verified", submission_id, operator=getpass.getuser(),
+                           operator_login=g.get("operator_login"), remote_addr=request.remote_addr,
+                           found=outcome.get("found"), token=outcome.get("token"), message=outcome.get("message"),
+                           rules=[{"key": r["key"], "verdict": r["verdict"]} for e in outcome.get("events", [])[:1] for r in e["rules"]])
+        except OSError:
+            pass
+        return jsonify(**outcome, log=log.entries)
 
     return app
 
@@ -534,4 +629,11 @@ if __name__ == "__main__":
         sys.exit(1)
     for warning in bind_warnings:
         print(warning, flush=True)
-    create_app().run(host=bind_host, port=bind_port, threaded=True, request_handler=QuietRequestHandler)
+    try:
+        refresh_minutes_from(os.environ.get("RULE_REFRESH_MINUTES"))
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr, flush=True)
+        sys.exit(1)
+    application = create_app()
+    application.extensions["rulebook"].start_refresher(ActivityLog)
+    application.run(host=bind_host, port=bind_port, threaded=True, request_handler=QuietRequestHandler)

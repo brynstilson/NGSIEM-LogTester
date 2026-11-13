@@ -19,6 +19,8 @@ This guide covers sending a test log through one of your Falcon NG-SIEM data con
 |---|---|---|
 | NGSIEM Data Connections | Read and Write | Listing connectors, cloning them, ingest tokens, deleting the clone |
 | Correlation Rules | Read | The correlation rule check and rule-based samples (optional) |
+| NGSIEM Parsers | Read | Simulating each connector's real parser for the rule check and samples (optional) |
+| NGSIEM | Write | **Verify in NG-SIEM** after sending; it starts a search, which only reads data (optional) |
 
 Without the Correlation Rules scope, the app still sends logs, but it can't check them against rules.
 
@@ -103,7 +105,7 @@ Click **Built-in sample event** to open the sample list.
 
 ![Sample list with the filter box and the Vendor sample logs group highlighted](docs/howto/04-sample-picker.png)
 
-1. **Type to filter:** type part of a name, such as `okta` or `palo`, to shorten the list.
+1. **Type to filter:** type any words from a name, in any order, such as `okta failed` or `aws console`. Case and punctuation are ignored.
 2. **Vendor sample logs:** realistic logs in the format each vendor's NG-SIEM parser expects, such as Proofpoint TAP, Windows XML, Palo Alto CSV and Fortinet key=value.
 
 Scroll further down to see the samples generated from correlation rules.
@@ -132,9 +134,14 @@ Click a rule to see why it matches:
 
 ![A rule expanded to show each condition and whether the log meets it](docs/howto/05b-rule-detail.png)
 
-The table lists each condition the rule needs (**Rule wants**), the value in your log (**Log has**), whether it is met, and how the value was worked out (**Based on**). When a rule *almost* matches, the app suggests what to change in the log.
+The table lists each condition the rule needs (**Rule wants**), the value the parser would produce (**Log has**), whether it is met, and how the value was worked out (**Based on**). When a rule *almost* matches, the app suggests what to change in the raw log, for example "The parser sets event.reason from the raw field "classification": give "classification" the value "phish"."
 
-> **This is an estimate.** The app reads the raw log and predicts the parser's fields. NG-SIEM's own evaluation is the final answer.
+**Information icons:**
+- **(i) next to the badge, simulated parsed event:** hover over it to see the event the connector's parser would produce from your log: tags, ECS fields and `Vendor.` fields. The app runs the parser's own logic from your tenant to work this out. Fields it can't predict, such as values from lookup files, are marked unknown.
+- **(i) next to "Can't fully check":** hover over it to see why, for example a query that correlates several events, or a field set from a lookup file.
+- **(i) next to a rule's verdict:** the same reasons, for that rule alone.
+
+> **This is a prediction.** NG-SIEM's own evaluation is the final answer. After sending, use **Verify in NG-SIEM** (Step 8) to check against it.
 
 ### Optional: include CrowdStrike's rule templates
 
@@ -144,6 +151,10 @@ By default, only rules configured in your tenant are checked, which takes a sing
 
 1. Click **Load samples for CrowdStrike rule templates**. Loading can take 15 seconds or more, because there are over 1,600 templates. Click the button again to hide them.
 2. The status line shows how many configured-rule and template samples are listed.
+
+Samples are built against your tenant's real parsers and checked by simulating them. A sample the check doesn't expect to fire its rule is labelled **incomplete** in the list, and the note under the list says why.
+
+**New rules appear automatically:** the app re-reads your configured rules every `RULE_REFRESH_MINUTES` (15 by default, set in `.env`), and the list updates within about a minute, keeping your selection. **Reload rules** re-reads them immediately.
 
 ## Step 6: Choose how to send the log
 
@@ -190,7 +201,7 @@ The verbose log shows, in order:
 
 Use it when troubleshooting, or attach it to a ticket.
 
-**To confirm the parser worked,** search Falcon **Advanced Event Search** for `NGSIEM-LogTester-TEST` a minute or two later, and check that the fields came out as expected.
+**To confirm the parser worked,** click **Verify in NG-SIEM** under the result banner, a minute or two after sending. It finds your events in NG-SIEM, shows NG-SIEM's parsed event, compares it with the app's simulation, and re-checks the rules against what NG-SIEM actually produced. If nothing is found yet, wait a minute and click again. It needs the **NGSIEM: Write** scope; without it, the app says so. You can also search Falcon **Advanced Event Search** for `NGSIEM-LogTester-TEST`.
 
 ## Step 9: Testing a PULL connector
 

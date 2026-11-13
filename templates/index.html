@@ -19,6 +19,25 @@
     }
   }
   * { box-sizing: border-box; }
+  .info { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px;
+          margin-left: 4px; border: 1px solid var(--muted); border-radius: 50%; color: var(--muted); font: 600 11px/1 system-ui, sans-serif;
+          cursor: help; vertical-align: middle; flex: none; }
+  .info:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .info .tip { display: none; position: absolute; z-index: 40; left: -8px; top: calc(100% + 8px); width: min(600px, 86vw);
+               max-height: 460px; overflow: auto; background: var(--panel); color: var(--text); border: 1px solid var(--line);
+               border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.18); padding: 10px 12px; text-align: left;
+               font: 400 13px/1.45 system-ui, "Segoe UI", sans-serif; white-space: normal; cursor: auto; }
+  .info:hover .tip, .info:focus .tip, .info:focus-within .tip { display: block; }
+  .tip h4 { margin: 0 0 6px; font-size: 13px; }
+  .tip ul { margin: 4px 0 8px; padding-left: 18px; }
+  .tip table { border-collapse: collapse; width: 100%; font: 12px/1.4 ui-monospace, Consolas, monospace; }
+  .tip td { border-top: 1px solid var(--line); padding: 2px 6px 2px 0; vertical-align: top; overflow-wrap: anywhere; }
+  .tip td:first-child { color: var(--muted); white-space: nowrap; }
+  .tip .unknown { color: var(--warn); }
+  .tip .note { color: var(--muted); margin: 6px 0 0; }
+  .verify { margin-top: 12px; }
+  .verify .result { margin: 10px 0; }
+  .result.warn { background: var(--warn-bg); color: var(--warn); }
   body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, "Segoe UI", sans-serif; }
   main { max-width: 860px; margin: 0 auto; padding: 32px 16px 64px; }
   h1 { font-size: 22px; margin: 0 0 4px; }
@@ -152,6 +171,8 @@
       <div class="rulecheck-head">
         <strong>Correlation rule check</strong>
         <span class="badge muted" id="rule-badge">Checking...</span>
+        <span id="badge-info"></span>
+        <span id="sim-info"></span>
         <button id="rules-refresh" type="button" class="link">Reload rules</button>
       </div>
       <p class="hint" id="rule-summary"></p>
@@ -174,6 +195,13 @@
 
   <section id="result-panel" aria-live="polite" hidden>
     <div class="result" id="result"></div>
+    <div id="verify-box" class="verify" hidden>
+      <div class="row">
+        <button id="verify" type="button">Verify in NG-SIEM</button>
+        <span class="hint">Searches NG-SIEM for these events and checks the rules against NG-SIEM's own parsing. New events can take a few minutes to become searchable.</span>
+      </div>
+      <div id="verify-result"></div>
+    </div>
     <details id="log-details">
       <summary id="log-summary">Verbose log</summary>
       <div class="log" id="log-entries"></div>
@@ -245,6 +273,49 @@
     return rule.enabled ? "Configured, enabled" : "Configured, not enabled";
   }
 
+  // A small (i) icon whose explanation shows on hover or keyboard focus.
+  function infoIcon(label, children) {
+    return el("span", { className: "info", tabIndex: 0, role: "button", ariaLabel: label, textContent: "i" },
+      [el("span", { className: "tip", role: "tooltip" }, children)]);
+  }
+
+  function reasonsTip(title, reasons) {
+    return infoIcon(title, [el("h4", { textContent: title }), el("ul", {}, reasons.map((r) => el("li", { textContent: r })))]);
+  }
+
+  // The parsed event the connector's parser would probably produce, as the rule check saw it.
+  function simulationTip(sim) {
+    if (!sim) return null;
+    if (!sim.available) {
+      return infoIcon("About the rule check", [el("h4", { textContent: "Approximate check" }), el("p", { textContent: sim.message })]);
+    }
+    const event = (sim.events || [])[0];
+    if (!event) return null;
+    const rows = [];
+    const add = (name, value, unknown = false) => rows.push(el("tr", {}, [el("td", { textContent: name }),
+      el("td", { className: unknown ? "unknown" : "", textContent: value })]));
+    for (const [k, v] of Object.entries(event.tags || {})) add(k, v);
+    const fields = Object.entries(event.fields || {}).filter(([k]) => !Object.prototype.hasOwnProperty.call(event.tags || {}, `#${k}`));
+    const ecs = fields.filter(([k]) => !k.startsWith("Vendor."));
+    const vendor = fields.filter(([k]) => k.startsWith("Vendor."));
+    for (const [k, v] of ecs.slice(0, 80)) add(k, v);
+    for (const name of (event.unknown || []).slice(0, 20)) add(name, "unknown (set by a lookup or function the simulation can't run)", true);
+    for (const [k, v] of vendor.slice(0, 60)) add(k, v);
+    const hidden = Math.max(0, ecs.length - 80) + Math.max(0, vendor.length - 60);
+    const notes = [];
+    if (event.dropped) notes.push("The parser would drop this log, so no event would reach NG-SIEM.");
+    if ((event.unsupported || []).length) notes.push(`Not simulated: ${event.unsupported.join(", ")}.`);
+    if (event.error) notes.push(event.error);
+    if (hidden) notes.push(`${hidden} more field${hidden === 1 ? "" : "s"} not shown.`);
+    if ((sim.events || []).length > 1) notes.push(`First of ${sim.events.length} events shown.`);
+    notes.push("Simulated by running the parser's own logic on the raw log. NG-SIEM's real result can differ.");
+    return infoIcon("Simulated parsed event", [
+      el("h4", { textContent: `Simulated parsed event: ${sim.parser} parser, version ${sim.version}` }),
+      el("table", {}, [el("tbody", {}, rows)]),
+      ...notes.map((n) => el("p", { className: "note", textContent: n })),
+    ]);
+  }
+
   function ruleDetails(rule, open = false) {
     const conditionRows = (rule.conditions || []).map((c) => el("tr", {}, [
       el("td", {}, [el("code", { textContent: c.field })]),
@@ -261,8 +332,10 @@
       ? el("div", {}, [el("strong", { textContent: "Suggestions" }), el("ul", {}, rule.suggestions.map((s) => el("li", { textContent: s })))])
       : null;
     const severity = rule.severity !== null && rule.severity !== undefined ? `. Severity ${rule.severity}` : "";
+    const why = (rule.reasons || []).length && ["uncertain", "needs_more_events"].includes(rule.verdict)
+      ? reasonsTip(`Why "${VERDICTS[rule.verdict]}"`, rule.reasons) : null;
     return el("details", { className: "rule", open }, [
-      el("summary", { textContent: `${rule.name}: ${VERDICTS[rule.verdict] || rule.verdict}` }),
+      el("summary", {}, [`${rule.name}: ${VERDICTS[rule.verdict] || rule.verdict}`, why]),
       el("div", { className: "meta", textContent: `${sourceLabel(rule)}${severity}. ${rule.summary || ""}` }),
       suggestions,
       table,
@@ -325,14 +398,24 @@
       return node;
     }
 
+    // Search text and option names are compared as plain lower-case words, so "aws console",
+    // "AWS - Console" and "console aws" all match, and "paloalto" matches "Palo Alto".
+    const normalize = (text) => text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const squash = (text) => normalize(text).replace(/ /g, "");
+
     function build() {
-      const filter = search ? search.value.trim().toLowerCase() : "";
-      const matches = (text) => !filter || text.toLowerCase().includes(filter);
+      const words = search ? normalize(search.value).split(" ").filter(Boolean) : [];
+      // Every word must appear in the option's name or its group's name, in any order.
+      const matches = (text, group = "") => {
+        if (!words.length) return true;
+        const haystack = `${normalize(text)} ${normalize(group)}`;
+        const squashed = squash(text) + squash(group);
+        return words.every((word) => haystack.includes(word) || squashed.includes(word));
+      };
       const nodes = [];
       for (const child of select.children) {
         if (child.tagName === "OPTGROUP") {
-          const groupMatches = matches(child.label);
-          const options = [...child.children].filter((o) => groupMatches || matches(o.text));
+          const options = [...child.children].filter((o) => matches(o.text, child.label));
           if (!options.length) continue;
           nodes.push(el("div", { className: "picker-group", textContent: child.label }));
           nodes.push(...options.map(item));
@@ -526,6 +609,8 @@
   function showCheck(data) {
     const badge = $("rule-badge");
     const summary = $("rule-summary");
+    $("badge-info").replaceChildren();
+    $("sim-info").replaceChildren(...[simulationTip(data.simulation)].filter(Boolean));
     if (!data.success) {
       badge.className = "badge warn";
       badge.textContent = "Couldn't check";
@@ -536,8 +621,9 @@
     const all = data.groups.flatMap((g) => g.rules);
     const firing = data.will_fire.flatMap((g) => g.rules);
     const wouldMatch = all.filter((r) => r.verdict === "likely" && !(r.source === "configured" && r.enabled));
-    const unsure = all.filter((r) => r.verdict === "uncertain" && (r.source === "configured" || r.key === selectedRule));
+    // Declared before use: reading it any earlier throws, which froze the panel once templates loaded.
     const selectedRule = (samples.find((s) => s.id === sampleSelect.value) || {}).rule_key;
+    const unsure = all.filter((r) => r.verdict === "uncertain" && (r.source === "configured" || r.key === selectedRule));
     if (firing.length) {
       badge.className = "badge bad";
       badge.textContent = `Will probably trigger ${firing.length} rule${firing.length === 1 ? "" : "s"}`;
@@ -550,6 +636,10 @@
     } else if (unsure.length) {
       badge.className = "badge warn";
       badge.textContent = "Can't fully check";
+      const reasons = [];
+      for (const r of unsure) for (const reason of (r.reasons || [])) reasons.push(`${r.name}: ${reason}`);
+      $("badge-info").replaceChildren(reasonsTip("Why the check is uncertain", reasons.length ? reasons.slice(0, 12)
+        : ["Some conditions depend on what the parser produces, so they can't be checked from the raw log."]));
     } else {
       badge.className = "badge ok";
       badge.textContent = "Not likely to trigger a rule";
@@ -760,7 +850,8 @@
     for (const [name, items] of Object.entries(groups)) {
       sampleSelect.append(el("optgroup", { label: `${name}: correlation rules` }, items.map((t) => {
         const tag = t.rule_source === "template" ? "template" : t.enabled ? "configured" : "configured, not enabled";
-        return new Option(`${t.label} (${tag})`, t.id);
+        // Samples the check doesn't expect to fire their rule are marked, so none is silently incomplete.
+        return new Option(`${t.label} (${tag}${t.incomplete ? ", incomplete" : ""})`, t.id);
       })));
     }
     if (samples.some((s) => s.id === previous)) sampleSelect.value = previous;
@@ -772,7 +863,9 @@
     if (sample.rule_key) {
       const verdict = VERDICTS[sample.verdict] || sample.verdict;
       const kind = sample.rule_source === "template" ? "CrowdStrike rule template" : sample.enabled ? "enabled rule in your tenant" : "rule in your tenant that isn't enabled";
-      $("sample-note-text").textContent = `Built to match the ${kind} "${sample.label}". Built-in check: ${verdict}. ${sample.note || ""}`;
+      const how = sample.simulated ? ` Built for the ${sample.parser} parser and checked by simulating it.` : "";
+      const incomplete = sample.incomplete ? " Incomplete: this sample may not trigger the rule." : "";
+      $("sample-note-text").textContent = `Built to match the ${kind} "${sample.label}". Built-in check: ${verdict}.${incomplete}${how} ${sample.note || ""}`;
       $("sample-source").hidden = true;
       return;
     }
@@ -848,8 +941,56 @@
       return;
     }
     showResult(data.success, data.message, data.log);
+    lastSubmission = data.verifiable ? data.submission_id : null;
+    $("verify-box").hidden = !lastSubmission;
+    $("verify-result").replaceChildren();
   }
 
+  // ---------------------------------------------------------------- verify in NG-SIEM
+  let lastSubmission = null;
+
+  async function verifySubmission() {
+    if (!lastSubmission) return;
+    const button = $("verify");
+    button.disabled = true;
+    button.textContent = "Searching NG-SIEM...";
+    const data = await callApi("/api/verify", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ submission_id: lastSubmission }),
+    });
+    button.disabled = false;
+    button.textContent = "Verify in NG-SIEM";
+    const out = $("verify-result");
+    if (!data.success) {
+      out.replaceChildren(el("p", { className: "result bad", textContent: data.message || "Verification failed." }));
+      return;
+    }
+    if (!data.found) {
+      out.replaceChildren(el("p", { className: "result warn", textContent: data.message }));
+      return;
+    }
+    const first = data.events[0];
+    const parts = [el("p", { className: "result ok", textContent: `Found ${data.found} event${data.found === 1 ? "" : "s"} in NG-SIEM containing "${data.token}".` })];
+    if (first.rules.length) {
+      parts.push(el("strong", { textContent: "Rules, checked against NG-SIEM's parsed event" }));
+      parts.push(el("ul", {}, first.rules.map((r) => el("li", { textContent: `${r.name}: ${VERDICTS[r.verdict] || r.verdict}. ${r.summary}` }))));
+    }
+    if (first.comparison) {
+      const c = first.comparison;
+      const diffs = Object.entries(c.different);
+      parts.push(el("p", { className: "hint", textContent: `Simulation vs NG-SIEM: ${c.matching_fields} fields matched, ${diffs.length} differed, ${c.only_in_ngsiem.length} only in NG-SIEM, ${c.only_in_simulation.length} only in the simulation.` }));
+      if (diffs.length) {
+        parts.push(el("ul", {}, diffs.slice(0, 20).map(([k, v]) => el("li", { textContent: `${k}: NG-SIEM "${v.ngsiem}", simulation "${v.simulated}"` }))));
+      }
+    }
+    const rows = Object.entries({ ...first.tags, ...first.fields }).slice(0, 200).map(([k, v]) =>
+      el("tr", {}, [el("td", {}, [el("code", { textContent: k })]), el("td", { textContent: v })]));
+    parts.push(el("details", {}, [el("summary", { textContent: "NG-SIEM's parsed event" }),
+      el("div", { className: "table-wrap" }, [el("table", { className: "conditions" }, [el("tbody", {}, rows)])])]));
+    out.replaceChildren(...parts);
+  }
+
+  $("verify").addEventListener("click", verifySubmission);
   sampleSelect.addEventListener("change", selectSample);
   $("templates-toggle").addEventListener("click", async () => {
     includeTemplates = !includeTemplates;
@@ -896,9 +1037,25 @@
   enhanceSelect(connectorSelect);
   enhanceSelect(sampleSelect, { searchable: true });
   enhanceSelect($("mode"));
+  // The server re-reads configured rules every RULE_REFRESH_MINUTES. The page asks once a minute
+  // whether they changed (no Falcon call) and reloads its rule samples if so, keeping the selection.
+  const RULE_REFRESH_MINUTES = {{ rule_refresh_minutes|int }};
+  let rulesVersion = null;
+  async function pollRules() {
+    const status = await callApi("/api/rules/status");
+    if (!status.success) return;
+    if (rulesVersion !== null && status.version !== rulesVersion) {
+      await loadSamples();
+      syncPickers();
+      runCheck();
+    }
+    rulesVersion = status.version;
+  }
+
   loadSettings();
-  loadSamples();
+  loadSamples().then(pollRules);
   loadConnectors();
+  if (RULE_REFRESH_MINUTES > 0) setInterval(pollRules, 60 * 1000);
 </script>
 </body>
 </html>

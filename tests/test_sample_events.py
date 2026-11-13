@@ -17,7 +17,7 @@ from sample_events import MARKER, SAMPLE_IDS, SAMPLES, list_samples, render_samp
 from workflow import Settings, parse_log
 
 REQUESTED_SOURCES = [
-    "Proofpoint TAP log", "Microsoft Windows system event log", "Microsoft Entra log", "Cisco UCS log",
+    "Proofpoint TAP log", "Proofpoint TAP click log", "Microsoft Windows system event log", "Microsoft Entra log", "Cisco UCS log",
     "Cisco Firepower log", "VMware vSphere log", "AWS CloudTrail log", "AWS SecurityHub log",
     "Abnormal Security email log", "Checkpoint NGFW log", "Claroty xDome log", "Cloudflare log",
     "Epic Systems EHR log", "Fortinet firewall log", "Google Workspace log", "Netskope log", "Okta log",
@@ -129,7 +129,7 @@ def web(tmp_path):
 def test_routes_list_and_render_samples(web):
     client = web[0].test_client()
     listing = client.get("/api/sample-events").get_json()
-    assert listing["success"] and len(listing["samples"]) == 20
+    assert listing["success"] and len(listing["samples"]) == 21
     loaded = client.get("/api/sample-events/okta").get_json()
     assert loaded["success"]
     assert json.loads(loaded["log"])["eventType"] == "user.session.start"

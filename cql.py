@@ -465,8 +465,8 @@ class Evaluator:
         if found.state is not None:
             return self.record(name, op, expected_text, found.state, found.value, found.basis, found.note)
         if found.value is None:
-            state = UNKNOWN if found.basis == "unmapped" else FALSE
-            if op == "!=" and found.basis != "unmapped":
+            state = UNKNOWN if _unknown(found.basis) else FALSE
+            if op == "!=" and not _unknown(found.basis):
                 state = TRUE
             suggestion = "" if state is TRUE else self.view.suggest_missing(name, op, value_kind, expected, found.basis)
             return self.record(name, op, expected_text, state, None, found.basis or "missing", suggestion)
@@ -489,7 +489,7 @@ class Evaluator:
             found = self.view.lookup(field_name, "=", values[0] if values else None)
             ignore = (named.get("ignorecase") or ("", ""))[1] == "true"
             if found.value is None:
-                return self.record(field_name, "in", ", ".join(values), FALSE if found.basis != "unmapped" else UNKNOWN,
+                return self.record(field_name, "in", ", ".join(values), FALSE if not _unknown(found.basis) else UNKNOWN,
                                    None, found.basis or "missing",
                                    self.view.suggest_missing(field_name, "=", "string", values[0] if values else "", found.basis))
             actual = found.value.lower() if ignore else found.value
@@ -500,7 +500,7 @@ class Evaluator:
             subnets = self._values(named.get("subnet"))
             found = self.view.lookup(field_name, "=", None)
             if found.value is None:
-                return self.record(field_name, "cidr", ", ".join(subnets), UNKNOWN if found.basis == "unmapped" else FALSE,
+                return self.record(field_name, "cidr", ", ".join(subnets), UNKNOWN if _unknown(found.basis) else FALSE,
                                    None, found.basis or "missing")
             try:
                 address = ipaddress.ip_address(found.value)
@@ -535,13 +535,18 @@ class Evaluator:
             ignore = (named.get("ignorecase") or ("", ""))[1] == "true"
             found = self.view.lookup(name, "=", None)
             if found.value is None:
-                return self.record(name, "wildcard", pattern, FALSE if found.basis != "unmapped" else UNKNOWN, None, found.basis or "missing")
+                return self.record(name, "wildcard", pattern, FALSE if not _unknown(found.basis) else UNKNOWN, None, found.basis or "missing")
             actual, wanted = (found.value.lower(), pattern.lower()) if ignore else (found.value, pattern)
             return self.record(name, "wildcard", pattern, _glob(wanted, actual), found.value, found.basis)
         if function == "in":
             return self.call(("call", "in", [("word", name)], named))
         self.unsupported.append(f"{name} =~ {function}()")
         return UNKNOWN
+
+
+def _unknown(basis):
+    """A field whose value can't be known: unmapped, or unknown after simulating the parser."""
+    return basis == "unmapped" or str(basis).startswith("unknown")
 
 
 def closest(name, candidates):
