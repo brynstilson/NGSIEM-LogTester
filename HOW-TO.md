@@ -136,6 +136,8 @@ Click a rule to see why it matches:
 
 The table lists each condition the rule needs (**Rule wants**), the value the parser would produce (**Log has**), whether it is met, and how the value was worked out (**Based on**). When a rule *almost* matches, the app suggests what to change in the raw log, for example "The parser sets event.reason from the raw field "classification": give "classification" the value "phish"."
 
+**Accepting suggestions:** next to each suggestion the app can carry out there's an **Apply** button, and **Apply all suggestions** when there are several. The app makes the change to the log for you: it finds the raw field the parser reads, for example `classification` for `event.reason`. It then re-checks and says whether the rule now matches. Click **Undo** to put the log back. Nothing is sent until you click **Clone connector and send log**. Suggestions that depend on the connector rather than the log, such as a different `#Vendor`, have no button.
+
 **Information icons:**
 - **(i) next to the badge, simulated parsed event:** hover over it to see the event the connector's parser would produce from your log: tags, ECS fields and `Vendor.` fields. The app runs the parser's own logic from your tenant to work this out. Fields it can't predict, such as values from lookup files, are marked unknown.
 - **(i) next to "Can't fully check":** hover over it to see why, for example a query that correlates several events, or a field set from a lookup file.

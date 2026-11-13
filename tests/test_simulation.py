@@ -297,3 +297,80 @@ def test_verify_reports_nothing_found_yet():
     from rules import judge
     out = verify_module.verify(SearchClient([]), submission, [], sim, judge, Log())
     assert out["found"] == 0 and "few minutes" in out["message"]
+
+
+# ---- accepting a suggestion
+
+from suggest import apply_suggestion, want_from_condition  # noqa: E402
+
+
+def test_want_from_condition():
+    assert want_from_condition({"op": "=", "expected": "/phish/i"}) == ("regex", ("phish", "i"))
+    assert want_from_condition({"op": "=", "expected": "*"}) == ("exists",)
+    assert want_from_condition({"op": "in", "expected": "a, b"}) == ("in", ["a", "b"])
+    assert want_from_condition({"op": ">", "expected": "70"}) == ("num", ">", "70")
+
+
+def test_suggestion_is_applied_through_the_parser():
+    sim = Simulation(FakeStore({"acme-mail": JSON_PARSER}))
+    r = rule('#Vendor="acme" | event.reason=/phish/i | event.action="clicks-permitted"')
+    text = json.dumps({"eventType": "messagesDelivered", "senderIP": "192.0.2.10"})
+    from rules import judge
+    check = judge(r, [json.loads(text)], "acme-mail", sim)
+    fixes = [f for f in check["fixes"] if f["kind"] == "field"]
+    assert len(fixes) == 2
+    first = apply_suggestion(r, text, "event", "acme-mail", sim, fixes[0])
+    assert first["success"] and first["verdict"] != "likely"
+    both = apply_suggestion(r, text, "event", "acme-mail", sim, {"kind": "all"})
+    assert both["success"] and both["verdict"] == "likely", both
+    fixed = json.loads(both["log"])
+    assert fixed["eventType"] == "clicksPermitted" and "phish" in fixed["classification"].lower()
+    assert fixed["senderIP"] == "192.0.2.10"  # the rest of the log is kept
+
+
+def test_suggestions_about_the_connector_have_no_apply():
+    sim = Simulation(FakeStore({"acme-mail": JSON_PARSER}))
+    r = rule('#Vendor="other" | event.reason="phish"')
+    from rules import judge
+    check = judge(r, [{"classification": "spam"}], "acme-mail", sim)
+    vendor_fix = next(f for f in check["fixes"] if "connector" in f["text"].lower() or "#Vendor" in f["text"])
+    assert vendor_fix["kind"] is None
+
+
+def test_repeat_suggestion_makes_enough_events():
+    sim = Simulation(FakeStore({"acme-mail": JSON_PARSER}))
+    r = rule('#Vendor="acme" | event.reason="phish" | groupBy([source.ip], function=count(as=n)) | n >= 3')
+    text = json.dumps({"classification": "phish", "senderIP": "192.0.2.10"})
+    out = apply_suggestion(r, text, "event", "acme-mail", sim, {"kind": "repeat"})
+    assert out["success"] and len(json.loads(out["log"])) == 3
+
+
+def test_suggestion_without_simulation_uses_mappings():
+    r = normalize({"id": "o1", "name": "Okta rule", "search": {"filter": '#Vendor="okta" | event.action="user.session.start"'}}, "template")
+    text = json.dumps({"eventType": "user.account.lock"})
+    out = apply_suggestion(r, text, "event", "okta-sso", Simulation(None), {"kind": "all"})
+    assert out["success"] and json.loads(out["log"])["eventType"] == "user.session.start"
+
+
+def test_apply_suggestion_route(tmp_path):
+    from app import create_app
+    from app_settings import AppSettings
+    from falcon_client import FalconClient
+    from forensic_log import ForensicLog
+    client = FalconClient("id", "secret", "http://127.0.0.1:1", timeout=1)
+    sim = Simulation(FakeStore({"acme-mail": JSON_PARSER}))
+    web = create_app(client, forensic=ForensicLog(tmp_path / "f.jsonl"), app_settings=AppSettings(tmp_path / "s.json", tmp_path / "b"),
+                     admin_password="", access_password="", allowed_hosts="", rule_refresh_minutes=0, simulation=sim)
+    book = web.extensions["rulebook"]
+    r = rule('#Vendor="acme" | event.reason="phish"', source="configured")
+    import time as _t
+    book._cache["configured"] = ([r], None, _t.time())
+    tc = web.test_client()
+    body = {"log": json.dumps({"classification": "spam"}), "mode": "event", "rule_key": r["key"],
+            "fix": {"kind": "all"}, "sample_id": None}
+    # No connector or sample is selected, so name the parser through the rule's own sample entry.
+    r["parser"] = "acme-mail"
+    out = tc.post("/api/apply-suggestion", json=body).get_json()
+    assert out["success"] and json.loads(out["log"])["classification"] == "phish", out
+    missing = tc.post("/api/apply-suggestion", json={**body, "rule_key": "configured:nope"})
+    assert missing.status_code == 404

@@ -90,7 +90,8 @@ class ParserStore:
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
                 path.write_text(text, encoding="utf-8")
             except (FalconError, OSError):
-                older = sorted(self.cache_dir.glob(f"{_safe(name)}@*.yaml")) if self.cache_dir.exists() else []
+                # Files are saved as name_version.yaml (the @ is made file-safe); reuse the newest copy.
+                older = sorted(self.cache_dir.glob(f"{_safe(name)}_*.yaml")) if self.cache_dir.exists() else []
                 text = older[-1].read_text(encoding="utf-8") if older else None
         if not text:
             return None

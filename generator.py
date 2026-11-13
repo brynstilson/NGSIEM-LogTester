@@ -279,6 +279,18 @@ class Solver:
             items = [str(v[1]) for v in (values[1] if values and values[0] == "list" else []) if v[0] == "lit"]
             if field and items:
                 return self.resolve(str(field[1]), ("in", items), depth + 1, seen)
+        if kind == "apply":
+            # field =~ in(values=[...]), field =~ cidr(...), field =~ wildcard(...), field =~ regex(...)
+            _, field, (fname, positional, named) = cond
+            values = named.get("values") or named.get("subnet") or named.get("pattern") or named.get("regex") \
+                or (positional[0] if positional else None)
+            items = [str(v[1]) for v in (values[1] if values and values[0] == "list" else [values] if values else [])
+                     if v and v[0] in ("lit", "ref")]
+            if not items:
+                return True
+            want = {"in": ("in", items), "cidr": ("cidr", items), "wildcard": ("in", items),
+                    "regex": ("regex", (items[0], ""))}.get(fname)
+            return self.resolve(field, want, depth + 1, seen) if want else True
         return True  # not(...), text and other conditions don't block a branch here
 
 

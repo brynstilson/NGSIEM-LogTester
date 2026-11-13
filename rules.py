@@ -236,6 +236,10 @@ UNSUPPORTED_REASONS = {
 }
 
 
+# Set by the connector's parser or at ingest, so no change to the log can satisfy them.
+NOT_FIXABLE_IN_LOG = {"#Vendor", "Vendor", "@sourcetype", "#type", "#repo"}
+
+
 def raw_of(event):
     """The @rawstring NG-SIEM would hold for one submitted event."""
     return event if isinstance(event, str) else json.dumps(event)
@@ -326,13 +330,22 @@ def judge(rule_info, events, parser, simulation=None):
         for c in shown.conditions
     ]
     suggestions = []
-    for condition in (shown.conditions if verdict != LIKELY else []):
+    # Each suggestion the operator can accept: "condition" points at the condition it fixes, so the
+    # app can make the change to the log itself. Suggestions about the connector, not the log, have none.
+    fixes = []
+    for index, condition in enumerate(shown.conditions if verdict != LIKELY else []):
         if condition.state is not TRUE and condition.suggestion and condition.suggestion not in suggestions:
             suggestions.append(condition.suggestion)
+            applicable = condition.state is FALSE and condition.field not in NOT_FIXABLE_IN_LOG
+            fixes.append({"text": condition.suggestion, "kind": "field" if applicable else None,
+                          "condition": index if applicable else None})
     if rule.threshold > 1 and matching < rule.threshold:
-        suggestions.append(f"Send at least {rule.threshold} matching events as a JSON array.")
+        text = f"Send at least {rule.threshold} matching events as a JSON array."
+        suggestions.append(text)
+        fixes.append({"text": text, "kind": "repeat", "condition": None})
     return {**base, "verdict": verdict, "summary": summary, "conditions": conditions,
-            "suggestions": suggestions, "matching_events": matching, "reasons": reasons, "simulated": simulated}
+            "suggestions": suggestions, "fixes": fixes, "matching_events": matching, "reasons": reasons,
+            "simulated": simulated}
 
 
 def evaluate(rules, text, mode, parser, simulation=None):

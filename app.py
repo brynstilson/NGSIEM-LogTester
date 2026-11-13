@@ -22,6 +22,7 @@ from field_model import PROFILES
 from parsers import ParserStore
 from rules import RuleBook, evaluate, events_of, group, judge, raw_of, refresh_minutes_from, rule_templates, template_entry
 from simulation import Simulation
+from suggest import apply_suggestion
 from verify import verify
 from sample_events import SAMPLE_IDS, list_samples, render_sample
 from workflow import MODE_EVENT, MODE_RAW, Settings, connector_section, is_pull, submit_log
@@ -399,6 +400,29 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
             will_fire=group(checked["will_fire"]),
             simulation=simulation_summary(text, data.get("mode", MODE_EVENT), checked.get("parser")),
         )
+
+    @app.post("/api/apply-suggestion")
+    def apply_suggestion_route():
+        """Make a rule check suggestion's change to the operator's log. Nothing is sent anywhere."""
+        data = request.get_json(silent=True)
+        if not request.is_json or not isinstance(data, dict):
+            return jsonify(success=False, message="Expected a JSON request."), 415
+        text = data.get("log") if isinstance(data.get("log"), str) else ""
+        mode = data.get("mode") if data.get("mode") in (MODE_EVENT, MODE_RAW) else MODE_EVENT
+        fix = data.get("fix") if isinstance(data.get("fix"), dict) else {}
+        rule_key = data.get("rule_key")
+        rule = rulebook.find(rule_key) if isinstance(rule_key, str) else None
+        if rule is None:
+            return jsonify(success=False, message="That rule isn't loaded. Reload rules and try again."), 404
+        log = ActivityLog()
+        # The same parser the rule check used: the connector's, the sample's, or the rule's own.
+        parser = (parser_for(data.get("connector_id"), log) or sample_parser(data.get("sample_id"))
+                  or (entry_for(rule) or {}).get("parser") or rule.get("parser"))
+        try:
+            outcome = apply_suggestion(rule, text, mode, parser, simulation, fix)
+        except Exception as exc:  # A suggestion that can't be applied must not break the page.
+            outcome = {"success": False, "message": f"The suggestion couldn't be applied ({type(exc).__name__})."}
+        return jsonify(**outcome)
 
     @app.get("/api/sample-events/<sample_id>")
     def sample_event(sample_id):

@@ -52,6 +52,22 @@ def _names(node):
     return [n] if n else []
 
 
+FILTER_APPLY = {"in", "cidr", "wildcard", "regex"}
+
+
+def _branch_filter(stage):
+    """The condition a stage at the start of a case branch stands for, or None if it isn't one.
+
+    Plain filters count, and so does `field =~ in(...)` (or cidr, wildcard, regex), which the
+    parser reads as a stage of its own.
+    """
+    if stage[0] == "filter" and stage[1][0] not in ("call",):
+        return stage[1]
+    if stage[0] == "apply" and stage[2][0] in FILTER_APPLY:
+        return ("apply", stage[1], stage[2])
+    return None
+
+
 def _prefix(text):
     if not text:
         return ""
@@ -89,8 +105,8 @@ class Lineage:
                 for branch in stage[1]:
                     leading = []
                     for st in branch:
-                        if st[0] == "filter" and st[1][0] not in ("call",):
-                            leading.append(st[1])
+                        if _branch_filter(st) is not None:
+                            leading.append(_branch_filter(st))
                         else:
                             break
                     if not leading or any(node[0] == "true" for node in leading):
@@ -117,8 +133,8 @@ class Lineage:
             elif kind == "case":
                 for branch in stage[1]:
                     leading, rest = [], list(branch)
-                    while rest and rest[0][0] == "filter" and rest[0][1][0] not in ("call",):
-                        leading.append(rest.pop(0)[1])
+                    while rest and _branch_filter(rest[0]) is not None:
+                        leading.append(_branch_filter(rest.pop(0)))
                     # Regex filters at the start of a branch also extract fields.
                     for node in leading:
                         self._extract(node, conds)

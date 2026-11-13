@@ -77,6 +77,7 @@ apply to everyone using the installation.
 | `generator.py` | Builds a raw log that the real parser turns into an event matching a rule, checked by simulation |
 | `regex_sample.py` | Builds text that matches a regex, used for rule values and syslog lines |
 | `simulation.py` | Ties the parser store, simulator and lineage together, with caching |
+| `suggest.py` | Applies a rule check suggestion to the operator's log, through the parser's lineage |
 | `verify.py` | Finds a submission's events in NG-SIEM and checks the rules against NG-SIEM's own parsing |
 | `falcon_client.py` | Falcon API calls and the masked verbose log |
 | `forensic_log.py` | The append-only log on disk |
@@ -320,6 +321,15 @@ Each listed rule expands to show its conditions, what the log has, and what each
 Suggestions name the raw field to add or change, catch case mismatches and near-miss field names,
 and say how many events are still needed. When a rule has `case` branches, suggestions follow the
 branch closest to passing.
+
+**Accepting a suggestion:** a suggestion the app can carry out has an **Apply** button, and a rule with
+several has **Apply all suggestions**. The app works out the change the same way it builds samples,
+back through the connector's parser to the raw field that produces the value (for example, setting
+`classification` so that the parser gives `event.reason = phish`). It edits the log in the log window,
+keeping everything else, then re-runs the check and says whether the rule now matches. **Undo** puts
+the log back. "Send at least N events" copies the event into a JSON array of N. Suggestions about the
+connector rather than the log, such as a different `#Vendor`, have no button. Applying a suggestion
+only changes the text in the page; nothing is sent until you click **Clone connector and send log**.
 
 **Which parser is assumed:** the selected connector's parser. With no connector selected, the
 parser the selected sample or template was written for is used instead.
