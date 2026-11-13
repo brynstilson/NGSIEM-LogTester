@@ -13,9 +13,13 @@ client secret, and the app needs both. Give it these scopes:
 | --- | --- | --- |
 | NGSIEM Data Connections | Read and Write | Listing connectors, reading parsers, creating and deleting clones, ingest tokens |
 | Correlation Rules | Read | Reading configured rules and CrowdStrike's rule templates |
+| NGSIEM Parsers | Read | Reading parser definitions, so the app can simulate each connector's parser |
+| NGSIEM | Write | Verifying a submission: starting a search in NG-SIEM. Searches only read data |
 
 Correlation Rules Write isn't needed. Without the Correlation Rules scope, the app still sends logs,
-but it can't check them against rules.
+but it can't check them against rules. Without NGSIEM Parsers: Read, the rule check falls back to
+approximate field mappings. Without NGSIEM: Write, the **Verify in NG-SIEM** button explains which
+scope is missing.
 
 On Windows:
 
@@ -66,7 +70,15 @@ apply to everyone using the installation.
 | `sample_events.py` | The built-in synthetic sample events |
 | `rules.py` | Loading correlation rules, judging a submission against them, and building rule templates |
 | `cql.py` | Reading a rule's CQL query and evaluating its filter against one event |
-| `field_model.py` | What each parser gives a rule: tags, `Vendor.` fields, ECS mappings and text-format readers |
+| `field_model.py` | What a rule sees: the simulated parsed event (`ParsedView`), or approximate mappings as a fallback |
+| `parsers.py` | Reading parser definitions from the tenant and caching them on disk |
+| `parser_sim.py` | The parser simulator: runs a parser script on a raw log to predict the parsed event |
+| `lineage.py` | Static analysis of a parser: which raw field, case branch or match arm produces each field |
+| `generator.py` | Builds a raw log that the real parser turns into an event matching a rule, checked by simulation |
+| `regex_sample.py` | Builds text that matches a regex, used for rule values and syslog lines |
+| `simulation.py` | Ties the parser store, simulator and lineage together, with caching |
+| `suggest.py` | Applies a rule check suggestion to the operator's log, through the parser's lineage |
+| `verify.py` | Finds a submission's events in NG-SIEM and checks the rules against NG-SIEM's own parsing |
 | `falcon_client.py` | Falcon API calls and the masked verbose log |
 | `forensic_log.py` | The append-only log on disk |
 | `app_settings.py` | Administrator settings: title, logo and contact details |
@@ -231,8 +243,34 @@ CrowdStrike rule templates** under the sample dropdown. Once loaded, template sa
 and the live check, and the same button hides them again. Submitting never loads the templates, because
 templates can't fire.
 
-Rules are cached for 15 minutes. After changing rules in Falcon, use **Reload rules** in the rule
-check panel under the log window.
+**Keeping rules current:** the server re-reads configured rules every `RULE_REFRESH_MINUTES` (default
+15, `0` turns it off). The page checks once a minute whether they changed (no Falcon call) and reloads
+the rule samples, keeping your selection. A submission always re-reads configured rules if the stored
+copy is over a minute old, so a rule just enabled in Falcon is checked before anything is sent.
+**Reload rules** in the rule check panel re-reads them immediately. Templates are cached for 15 minutes.
+
+### Parser simulation
+
+The rule check and the generated samples use the connector's real parser. The app reads the parser
+definition from the tenant (**NGSIEM Parsers: Read**), caches it under `cache/parsers`, and runs it on
+the log with a simulator that interprets the parser language: case and match blocks, filters, `:=`
+assignments, regex extraction, and functions such as `parseJson`, `kvParse`, `parseCEF`, `parseCsv`,
+`parseXml`, `replace`, `lower`, `coalesce`, `format`, `splitString` and the array functions. All 318
+parsers in the tenant read without errors.
+
+The result is a predicted parsed event: tags such as `#Vendor` and `#event.dataset`, ECS fields such as
+`event.reason`, and the `Vendor.` fields. Hover over the **(i)** icon next to the rule check badge to
+see it. Some things can't be simulated, such as lookup files (`match(file=...)`), IP geolocation or
+an unfamiliar function. The fields those set are shown as unknown instead of being guessed, and a rule
+that depends on them is marked **Can't fully check**.
+
+**Why "Can't fully check":** hover over the **(i)** icon next to that badge, or next to a rule's
+verdict, to see the reasons. They are:
+- the query uses something the check can't evaluate, such as `correlate()`, `defineTable()`,
+  `ioc:lookup()`, a lookup file, or a filter after aggregation;
+- a condition depends on a field the parser sets with a lookup file or a function the simulation can't run;
+- no parser is known, because no connector is selected and the rule's vendor has no parser in the tenant;
+- only fields the parser sets for every log (such as `#Vendor`) matched, so nothing in the log was tested.
 
 ### Rule templates in the dropdown
 
@@ -242,14 +280,22 @@ For each rule a third-party log could trigger, the dropdown has a generated log:
   are grouped by their vendor list, as "Multiple sources".
 - **Labelled by source:** configured, configured but not enabled, or CrowdStrike template. A template
   that one of your configured rules was created from is listed once, as the configured rule.
-- **Built from the vendor's sample event,** changed to meet the rule's conditions. A rule that needs
-  several events gets enough of them. Key=value text, such as Fortinet's, is edited field by field.
-  Other text formats, such as XML or CSV, are left as they are, and the note under the dropdown says
-  what to change.
+- **Built against the real parser.** The generator works backwards from the rule's conditions through
+  the parser's logic, such as "`event.reason` is copied from `Vendor.classification`" or "`event.action`
+  is `clicks-permitted` when `Vendor.eventType` is `clicksPermitted`", to the raw fields the log needs.
+  It starts from the vendor's sample events (Proofpoint has a message and a click event), or from a
+  skeleton in the parser's format. Syslog lines are built from the parser's own extraction patterns,
+  JSON strings inside fields are written as JSON text, and Windows XML is edited in place. It then
+  simulates the parser and re-runs the check, trying other ways of producing a field until the rule
+  matches. A rule that needs several events gets enough of them.
+- **Never silently incomplete.** A sample the check doesn't expect to fire its rule is labelled
+  "incomplete" in the dropdown, and the note says which conditions couldn't be placed and why.
 - **Rules over Falcon sensor data get no template,** because no third-party log can trigger them.
 
 All the page's dropdowns open a scrollable, left-aligned list in which long names wrap rather than
-being cut off. The sample list also has a filter box, which matches option and group names.
+being cut off. The sample list also has a filter box. It matches every word you type, in any order and
+ignoring case and punctuation, against option and group names: `okta failed`, `aws console` and
+`paloalto` all work.
 
 The note under the dropdown names the rule a template was built for and gives the check's verdict.
 
@@ -275,6 +321,15 @@ Each listed rule expands to show its conditions, what the log has, and what each
 Suggestions name the raw field to add or change, catch case mismatches and near-miss field names,
 and say how many events are still needed. When a rule has `case` branches, suggestions follow the
 branch closest to passing.
+
+**Accepting a suggestion:** a suggestion the app can carry out has an **Apply** button, and a rule with
+several has **Apply all suggestions**. The app works out the change the same way it builds samples,
+back through the connector's parser to the raw field that produces the value (for example, setting
+`classification` so that the parser gives `event.reason = phish`). It edits the log in the log window,
+keeping everything else, then re-runs the check and says whether the rule now matches. **Undo** puts
+the log back. "Send at least N events" copies the event into a JSON array of N. Suggestions about the
+connector rather than the log, such as a different `#Vendor`, have no button. Applying a suggestion
+only changes the text in the page; nothing is sent until you click **Clone connector and send log**.
 
 **Which parser is assumed:** the selected connector's parser. With no connector selected, the
 parser the selected sample or template was written for is used instead.
@@ -310,6 +365,20 @@ vCenter `Event [...]` lines and Palo Alto CSV, follow the logic of the tenant's 
 - **Coverage in practice:** in live testing against 1,628 rules, 253 needed Falcon sensor data, and
   most of the rest could only be judged "can't fully check". Treat "Unlikely" and "Can't fully check"
   as estimates, not guarantees.
+
+## Verifying a submission in NG-SIEM
+
+After a successful submission, **Verify in NG-SIEM** searches NG-SIEM (repository `search-all`) for the
+submission's events, using a distinctive piece of the log such as the sample marker and ID. It then:
+
+- shows NG-SIEM's own parsed event;
+- compares it with the simulation (fields that matched, differed, or appear in only one);
+- re-runs the rules the check flagged, and the rule a sample was built for, against NG-SIEM's parsed event.
+
+New events can take a few minutes to become searchable, so the button can be pressed again. It needs
+the **NGSIEM: Write** scope, because starting a search is a write call even though searches only read
+data. The result is recorded in the forensic log as `submission_verified`. Only submissions made since
+the app started can be verified.
 
 ## Pull connectors
 

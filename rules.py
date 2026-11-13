@@ -8,13 +8,24 @@ import time
 
 from cql import FALSE, TRUE, UNKNOWN, Evaluator, parse_rule, tokenize
 from falcon_client import FalconError
-from field_model import PREFIX, PROFILES, EventView, example_value, profile_for_rule, raw_value_for, text_fields
+from field_model import PREFIX, PROFILES, EventView, ParsedView, example_value, profile_for_rule, raw_value_for, text_fields
 from sample_events import MARKER, render_sample
 
 LIKELY, UNCERTAIN, UNLIKELY, NEEDS_EVENTS, NOT_APPLICABLE = (
     "likely", "uncertain", "unlikely", "needs_more_events", "not_applicable",
 )
-CACHE_SECONDS = 900  # Rules change rarely, and loading 1,600 templates takes a while.
+DEFAULT_REFRESH_MINUTES = 15  # RULE_REFRESH_MINUTES: how often configured rules are re-read from the tenant.
+TEMPLATE_CACHE_SECONDS = 900  # CrowdStrike's templates change rarely, and loading 1,600 takes a while.
+
+
+def refresh_minutes_from(value):
+    """RULE_REFRESH_MINUTES as whole minutes, 0 meaning off. Raises ValueError for anything else."""
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return DEFAULT_REFRESH_MINUTES
+    if not re.fullmatch(r"\d+", text):
+        raise ValueError(f"RULE_REFRESH_MINUTES must be a whole number of minutes (0 turns it off), not {text!r}.")
+    return int(text)
 
 
 def _query_of(raw):
@@ -70,6 +81,9 @@ def normalize(raw, source):
         "vendor": vendor,
         "product": product,
         "parser": parser_key,
+        "vendor_tag": vendor_tag,
+        "module_tag": module,
+        "sourcetype": sourcetype,
         "threshold": rule.threshold,
         "endpoint_only": rule.endpoint_only,
         "_rule": rule,
@@ -94,10 +108,41 @@ class RuleBook:
     so they're only fetched when the operator asks for them.
     """
 
-    def __init__(self, client):
+    def __init__(self, client, refresh_minutes=DEFAULT_REFRESH_MINUTES):
         self.client = client
+        self.refresh_minutes = refresh_minutes
         self._cache = {"configured": ([], None, 0), "template": ([], None, 0)}
         self._lock = threading.Lock()
+        self.version = 0          # Goes up whenever the configured rules change, so pages know to reload.
+        self._fingerprint = None
+        self._stop = threading.Event()
+
+    def _max_age(self, source):
+        if source == "template":
+            return TEMPLATE_CACHE_SECONDS
+        # With refreshing off, configured rules are only re-read on request or at submit.
+        return self.refresh_minutes * 60 if self.refresh_minutes else float("inf")
+
+    def status(self):
+        loaded_at = self._cache["configured"][2]
+        return {"version": self.version, "refresh_minutes": self.refresh_minutes,
+                "loaded_at": loaded_at or None}
+
+    def start_refresher(self, log_factory):
+        """Re-read configured rules every refresh_minutes in the background. Does nothing if that's 0."""
+        if not self.refresh_minutes:
+            return None
+
+        def run():
+            while not self._stop.wait(self.refresh_minutes * 60):
+                self._get("configured", log_factory(), refresh=True)
+
+        thread = threading.Thread(target=run, name="rule-refresher", daemon=True)
+        thread.start()
+        return thread
+
+    def stop_refresher(self):
+        self._stop.set()
 
     def _fetch(self, source, log):
         rules, unreadable = [], []
@@ -119,20 +164,34 @@ class RuleBook:
         error = f"{label}: {len(unreadable)} couldn't be read, such as {unreadable[0]}." if unreadable else None
         return rules, error
 
-    def _get(self, source, log, refresh):
+    def _get(self, source, log, refresh, max_age=None):
         with self._lock:
             rules, error, loaded_at = self._cache[source]
-            if refresh or not loaded_at or time.time() - loaded_at >= CACHE_SECONDS:
-                rules, error = self._fetch(source, log)
+            limit = self._max_age(source) if max_age is None else min(max_age, self._max_age(source))
+            if refresh or not loaded_at or time.time() - loaded_at >= limit:
+                fetched, fetch_error = self._fetch(source, log)
+                # A failed refresh keeps the rules already loaded, rather than emptying the list.
+                if fetch_error and not fetched and rules:
+                    error = fetch_error
+                else:
+                    rules, error = fetched, fetch_error
                 self._cache[source] = (rules, error, time.time())
+                if source == "configured":
+                    fingerprint = sorted((r["key"], r["query"], r["enabled"], r["name"]) for r in rules)
+                    if fingerprint != self._fingerprint:
+                        self._fingerprint = fingerprint
+                        self.version += 1
             return rules, error
 
     def templates_loaded(self):
         return bool(self._cache["template"][2])
 
-    def load(self, log, refresh=False, include_templates=False):
-        """Configured rules, plus the templates if asked. Returns (rules, error message or None)."""
-        configured, error = self._get("configured", log, refresh)
+    def load(self, log, refresh=False, include_templates=False, max_age=None):
+        """Configured rules, plus the templates if asked. Returns (rules, error message or None).
+
+        max_age (seconds) re-reads configured rules if the stored copy is older than that.
+        """
+        configured, error = self._get("configured", log, refresh, max_age)
         if not include_templates:
             return list(configured), error
         templates, template_error = self._get("template", log, refresh)
@@ -161,8 +220,42 @@ def events_of(text, mode):
     return [text.strip()] if mode == "raw" else []
 
 
-def _evaluate_event(rule, event, parser):
-    view = EventView(event, parser)
+UNSUPPORTED_REASONS = {
+    "correlate": "The query uses correlate(), which joins several events, possibly from other sources.",
+    "join": "The query uses join(), which needs other events.",
+    "selfjoinfilter": "The query uses selfJoinFilter(), which needs other events.",
+    "definetable": "The query uses defineTable(), which builds a table from other events.",
+    "match": "The query uses match() against a lookup file in your tenant.",
+    "lookup": "The query uses a lookup file in your tenant.",
+    "ioc:lookup": "The query checks CrowdStrike's threat intelligence with ioc:lookup(), which needs live intel data.",
+    "test": "The query uses test() with an expression the check can't evaluate.",
+    "neighbor": "The query uses neighbor(), which compares consecutive events.",
+    "sequence": "The query uses sequence(), which needs events in a set order.",
+    "filter after aggregation": "The query filters on a computed result after aggregating events.",
+    "case after aggregation": "The query branches on a computed result after aggregating events.",
+}
+
+
+# Set by the connector's parser or at ingest, so no change to the log can satisfy them.
+NOT_FIXABLE_IN_LOG = {"#Vendor", "Vendor", "@sourcetype", "#type", "#repo"}
+
+
+def raw_of(event):
+    """The @rawstring NG-SIEM would hold for one submitted event."""
+    return event if isinstance(event, str) else json.dumps(event)
+
+
+def view_for(event, parser, simulation=None):
+    """A ParsedView from the simulated parser when possible, otherwise the approximate EventView."""
+    if simulation is not None and parser:
+        result = simulation.run(parser, raw_of(event))
+        if result is not None and not result.error:
+            return ParsedView(event, result, parser, simulation.lineage(parser))
+    return EventView(event, parser)
+
+
+def _evaluate_event(rule, event, parser, simulation=None):
+    view = view_for(event, parser, simulation)
     computed = [name for kind, name in rule.stages if kind == "assign"]
     evaluator = Evaluator(view, computed)
     states = [evaluator.run(node) for kind, node in rule.stages if kind == "filter"]
@@ -172,10 +265,11 @@ def _evaluate_event(rule, event, parser):
         state = UNKNOWN
     else:
         state = TRUE
+    evaluator.view = view
     return state, evaluator
 
 
-def judge(rule_info, events, parser):
+def judge(rule_info, events, parser, simulation=None):
     """Whether a submission is likely to satisfy one rule, with the conditions behind it."""
     rule = rule_info["_rule"]
     base = {"key": rule_info["key"], "name": rule_info["name"], "vendor": rule_info["vendor"],
@@ -187,7 +281,7 @@ def judge(rule_info, events, parser):
     if not events:
         return {**base, "verdict": UNLIKELY, "summary": "There's no event to check.", "conditions": [],
                 "suggestions": [], "matching_events": 0}
-    outcomes = [_evaluate_event(rule, event, parser) for event in events]
+    outcomes = [_evaluate_event(rule, event, parser, simulation) for event in events]
     matching = sum(1 for state, _ in outcomes if state is TRUE)
     unknown = sum(1 for state, _ in outcomes if state is UNKNOWN)
     shown = next((ev for state, ev in outcomes if state is TRUE), None) or outcomes[0][1]
@@ -212,34 +306,62 @@ def judge(rule_info, events, parser):
         summary = "At least one of the rule's conditions isn't met."
     if unsupported:
         summary += f" Parts of the query can't be evaluated here: {', '.join(unsupported)}."
+    simulated = isinstance(getattr(shown, "view", None), ParsedView)
+    reasons = []
+    if verdict == UNCERTAIN or verdict == NEEDS_EVENTS:
+        for part in unsupported:
+            if part != "no condition on the log's own fields":
+                reasons.append(UNSUPPORTED_REASONS.get(part, f"The query uses {part}, which the check can't evaluate."))
+        if not parser:
+            reasons.append("No parser is known for this log: select a connector so its parser can be simulated.")
+        elif not simulated:
+            reasons.append(f"The {parser} parser couldn't be simulated, so field names are approximate.")
+        for c in shown.conditions:
+            if c.state is UNKNOWN:
+                reasons.append(f"{c.field}: {c.basis}.")
+        if matching and not content_checked:
+            reasons.append("Only fields the parser sets for every log (such as #Vendor) matched; nothing in the log itself was tested.")
+        if simulated and shown.view.result.unsupported:
+            reasons.append("The parser uses " + ", ".join(shown.view.result.unsupported) + ", which the simulation can't run.")
+    reasons = list(dict.fromkeys(r for r in reasons if r))
     conditions = [
         {"field": c.field, "op": c.op, "expected": c.expected, "actual": c.actual,
          "met": {TRUE: "yes", FALSE: "no", UNKNOWN: "unknown"}[c.state], "basis": c.basis}
         for c in shown.conditions
     ]
     suggestions = []
-    for condition in (shown.conditions if verdict != LIKELY else []):
+    # Each suggestion the operator can accept: "condition" points at the condition it fixes, so the
+    # app can make the change to the log itself. Suggestions about the connector, not the log, have none.
+    fixes = []
+    for index, condition in enumerate(shown.conditions if verdict != LIKELY else []):
         if condition.state is not TRUE and condition.suggestion and condition.suggestion not in suggestions:
             suggestions.append(condition.suggestion)
+            applicable = condition.state is FALSE and condition.field not in NOT_FIXABLE_IN_LOG
+            fixes.append({"text": condition.suggestion, "kind": "field" if applicable else None,
+                          "condition": index if applicable else None})
     if rule.threshold > 1 and matching < rule.threshold:
-        suggestions.append(f"Send at least {rule.threshold} matching events as a JSON array.")
+        text = f"Send at least {rule.threshold} matching events as a JSON array."
+        suggestions.append(text)
+        fixes.append({"text": text, "kind": "repeat", "condition": None})
     return {**base, "verdict": verdict, "summary": summary, "conditions": conditions,
-            "suggestions": suggestions, "matching_events": matching}
+            "suggestions": suggestions, "fixes": fixes, "matching_events": matching, "reasons": reasons,
+            "simulated": simulated}
 
 
-def evaluate(rules, text, mode, parser):
+def evaluate(rules, text, mode, parser, simulation=None):
     events = events_of(text, mode)
     results = []
     for rule in rules:
         parser_for_rule = parser or rule["parser"]
         try:
-            results.append(judge(rule, events, parser_for_rule))
+            results.append(judge(rule, events, parser_for_rule, simulation))
         except Exception as exc:  # One rule the reader can't handle mustn't hide the rest.
             results.append({
                 "key": rule["key"], "name": rule["name"], "vendor": rule["vendor"], "product": rule["product"],
                 "source": rule["source"], "enabled": rule["enabled"], "severity": rule["severity"],
                 "threshold": rule["threshold"], "verdict": UNCERTAIN, "conditions": [], "suggestions": [],
                 "matching_events": 0, "summary": f"This rule's query couldn't be checked ({type(exc).__name__}).",
+                "reasons": [f"The check hit an error on this rule's query ({type(exc).__name__})."], "simulated": False,
             })
     firing = [r for r in results if r["verdict"] == LIKELY and r["source"] == "configured" and r["enabled"]]
     return {"events": len(events), "results": results, "will_fire": firing}
@@ -294,6 +416,12 @@ def _requirements(node, negate=False):
         if negate:
             op = {"=": "!=", "!=": "=", "<": ">=", ">": "<=", "<=": ">", ">=": "<"}[op]
         return [("cmp", node[1], op, node[3])]
+    if kind == "call" and node[1] == "array:contains" and not negate:
+        named = node[3]
+        array, value = named.get("array"), named.get("value")
+        if array and value:
+            return [("contains", str(array[1]), str(value[1]))]
+        return []
     if kind == "call" and node[1] in ("in", "cidr"):
         return [(node[1] if not negate else f"!{node[1]}", node)]
     if kind == "text" and not negate:
@@ -366,6 +494,8 @@ def build_template(rule_info):
                 elif requirement[0] == "!in":
                     _set_path(event, path, f"{MARKER}-value")
                 continue
+            if requirement[0] == "contains":
+                continue  # Array membership is decided by the parser; only the simulation can place it.
             _, name, op, value = requirement
             if len(value) != 2 or value[0] not in ("string", "word", "regex"):
                 unmet.append(f"{name} must equal a computed value")
@@ -426,20 +556,42 @@ def _apply_kv(text, fields):
     return text
 
 
-def template_entry(rule):
-    """One dropdown entry: a generated log for a rule, or None if no third-party log fits it."""
+def template_entry(rule, simulation=None):
+    """One dropdown entry: a generated log for a rule, or None if no third-party log fits it.
+
+    With a parser simulation, the log is built against the real parser and confirmed by simulating
+    it. Without one, it falls back to the approximate field mappings.
+    """
     if rule["endpoint_only"]:
         return None
+    parser = rule["parser"]
+    simulated = False
     try:
-        log, note = build_template(rule)
-        if log is None:
-            return None
-        is_text = isinstance(log, str)
-        text = log if is_text else json.dumps(log, indent=2)
-        check = judge(rule, events_of(text, "raw" if is_text else "event"), rule["parser"])
+        from generator import generate
+        generated = generate(rule, simulation) if simulation is not None and simulation.active else None
+        if generated:
+            log, note, parser, simulated = generated["log"], generated["note"], generated["parser"], True
+            check = generated["check"]
+            is_text = isinstance(log, str)
+            text = generated["text"]
+        else:
+            log, note = build_template(rule)
+            if log is None:
+                return None
+            is_text = isinstance(log, str)
+            text = log if is_text else json.dumps(log, indent=2)
+            check = judge(rule, events_of(text, "raw" if is_text else "event"), parser, simulation)
     except Exception:  # Leave out a rule whose query can't be turned into a log.
         return None
+    if check["verdict"] != LIKELY and not note:
+        # Never silently incomplete: say why the sample may not trigger the rule.
+        reasons = check.get("reasons") or []
+        note = ("Why it may not fire: " + " ".join(reasons[:4])) if reasons else "The check doesn't expect this sample to trigger the rule."
     return {
+        "parser": parser,
+        "simulated": simulated,
+        "reasons": check.get("reasons") or [],
+        "incomplete": check["verdict"] != LIKELY,
         "id": f"rule:{rule['key']}",
         "label": rule["name"],
         "group": f"{rule['vendor']} / {rule['product']}",
@@ -453,7 +605,20 @@ def template_entry(rule):
     }
 
 
-def rule_templates(rules):
-    """Dropdown entries: one generated log per rule that a third-party log could trigger."""
-    entries = [entry for entry in (template_entry(rule) for rule in rules) if entry]
+def rule_templates(rules, simulation=None, cache=None):
+    """Dropdown entries: one generated log per rule that a third-party log could trigger.
+
+    cache maps (rule key, query) to an entry, so each rule's sample is only built once.
+    """
+    entries = []
+    for rule in rules:
+        key = (rule["key"], rule["query"], rule["enabled"])
+        if cache is not None and key in cache:
+            entry = cache[key]
+        else:
+            entry = template_entry(rule, simulation)
+            if cache is not None:
+                cache[key] = entry
+        if entry:
+            entries.append(entry)
     return sorted(entries, key=lambda e: (e["group"], e["label"].lower()))

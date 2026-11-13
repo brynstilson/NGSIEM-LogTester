@@ -475,9 +475,105 @@ def example_value(kind, expected):
         literal = body.strip("^$")
         if "|" in literal and "(" not in literal:
             literal = literal.split("|")[0]
-        literal = re.sub(r"\\(.)", r"\1", literal)
-        if re.search(r"[\[\]().*+?{}|]", literal):
-            return None
+        # \d, \s, \w and \b are classes, not escaped characters, so those need the regex sampler.
+        complex_escape = re.search(r"\\[A-Za-z0-9]", literal)
+        literal = re.sub(r"\\([^A-Za-z0-9])", r"\1", literal)
+        if complex_escape or re.search(r"[\[\]().*+?{}|]", literal):
+            # Too complex to read off as text, so build a string the pattern accepts.
+            from regex_sample import sample
+            flags = expected[1] if isinstance(expected, tuple) and len(expected) > 1 else ""
+            return sample(body, flags)
         return literal
     text = str(expected)
     return text.replace("*", "test") if "*" in text else text
+
+
+class ParsedView:
+    """The fields a rule would see, read from a simulation of the connector's real parser.
+
+    Same interface as EventView. Fields the simulation couldn't work out (lookup files, functions
+    it doesn't reproduce) are reported as unknown, so the rule check says "can't fully check"
+    instead of guessing. `lineage` tells suggestions which raw field the parser reads.
+    """
+
+    def __init__(self, raw_event, result, parser, lineage=None):
+        self.parser = parser
+        self.parser_key, self.profile = profile_for_parser(parser)
+        self.result = result
+        self.fields = result.fields
+        self.tags = set(result.tag_fields)
+        self.lineage = lineage
+        if isinstance(raw_event, str):
+            self.raw = read_text(raw_event, self.profile)
+            self.rawstring = raw_event
+            self.is_text = True
+        else:
+            self.raw = dict(flatten(raw_event))
+            self.rawstring = json.dumps(raw_event)
+            self.is_text = False
+
+    def _name(self, name):
+        return name[1:] if name.startswith("#") else name
+
+    def raw_name(self, name):
+        field = self._name(name)
+        if self.lineage:
+            source = self.lineage.raw_source(field)
+            if source:
+                return source
+        return field[len(PREFIX):] if field.startswith(PREFIX) else field
+
+    def lookup(self, name, op, expected):
+        if name == "@rawstring":
+            return Found(self.rawstring, "raw text")
+        if name == "#repo":
+            if op == "!=" and str(expected).startswith(("xdr", "base_sensor", "detections")):
+                return Found("third-party", "assumed: third-party data isn't in Falcon's own repositories", state=True)
+            return Found(basis="unknown: the repository is set at ingest, not by the parser")
+        if self.result.dropped:
+            return Found(basis="missing: the parser drops this log, so no event reaches NG-SIEM")
+        field = self._name(name)
+        if field == "@sourcetype" or field == "#type":
+            return Found(self.parser, "parser name")
+        if field in self.result.unknown:
+            return Found(basis="unknown: the parser sets this with a lookup file or function the simulation can't run",
+                         note=f"{name} can't be predicted from the raw log.")
+        if field in self.fields:
+            basis = "set by the parser (simulated)" if name.startswith("#") else "parsed (simulated)"
+            return Found(self.fields[field], basis, raw=field)
+        if self.result.error:
+            return Found(basis="unknown: the parser couldn't be simulated")
+        return Found(basis="missing after parsing", raw=field)
+
+    def array_values(self, array):
+        name = self._name(array[:-2] if array.endswith("[]") else array)
+        values, i = [], 0
+        while f"{name}[{i}]" in self.fields or f"{name}[{i}]" in self.result.unknown:
+            if f"{name}[{i}]" in self.result.unknown:
+                return None, "unknown: set by a lookup file or function the simulation can't run"
+            values.append(self.fields[f"{name}[{i}]"])
+            i += 1
+        return values, "set by the parser (simulated)"
+
+    def suggest_missing(self, name, op, kind, expected, basis):
+        if str(basis).startswith("unknown"):
+            return f"{name} can't be predicted from the raw log: the parser sets it with something the simulation can't run."
+        example = example_value(kind, expected)
+        hint = self.lineage.hint(self._name(name), example) if self.lineage else None
+        if hint:
+            return hint
+        raw = self.raw_name(name)
+        if self.is_text:
+            return f"Add {raw}={example} to the line."
+        return f'Add the field "{raw}" with the value "{example}".'
+
+    def suggest_value(self, name, op, kind, expected, found):
+        example = example_value(kind, expected)
+        if op == "!=":
+            return f'Change the log so the parser doesn\'t give {name} = "{expected}".'
+        hint = self.lineage.hint(self._name(name), example) if self.lineage else None
+        if hint:
+            return hint
+        if kind != "regex" and str(found.value).lower() == str(example).lower():
+            return f'Values are case-sensitive: the parser gives "{found.value}", the rule wants "{example}".'
+        return f'The parser gives {name} = "{found.value}"; the rule wants "{example}".'

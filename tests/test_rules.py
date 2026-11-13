@@ -523,7 +523,8 @@ def test_every_sample_names_its_parser_and_has_a_profile():
             assert sample["parser"] is None
             continue
         assert sample["parser"] in PARSER_PROFILES, sample["id"]
-        assert PARSER_PROFILES[sample["parser"]]["sample"] == sample["id"]
+        # A vendor can have several samples (message and click events); the profile names the main one.
+        assert sample["id"].startswith(PARSER_PROFILES[sample["parser"]]["sample"])
 
 
 def test_text_samples_keep_their_format_in_templates():
