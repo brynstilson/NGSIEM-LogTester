@@ -199,7 +199,7 @@ so this is a check against their logic, not a test run through them.
 
 | Source | Parser | Format the parser expects |
 | --- | --- | --- |
-| Proofpoint TAP | `proofpoint-tap` | One message per event, with `eventType` (such as `messagesDelivered`), which sets `event.action` |
+| Proofpoint TAP | `proofpoint-tap` | Three samples in the SIEM API schema: a delivered message with a phishing URL, a permitted click, and a message blocked for a malicious attachment. One event each, with `eventType` (such as `messagesDelivered`), which sets `event.action` |
 | Windows | `microsoft-windows` | Native Windows event XML (Raw mode) |
 | Entra | `microsoft-entra-id` | Azure Monitor sign-in record |
 | Cisco Firepower | `cisco-firepower` | `%FTD` syslog line (Raw mode) |
@@ -229,6 +229,30 @@ sent through a connector that uses a parser your tenant has.
 **Text formats:** samples for sources that send text (Windows, Cisco UCS, Cisco Firepower, vSphere,
 Epic, Fortinet and Palo Alto NGFW) are in their native format. Selecting one switches the send mode
 to Raw.
+
+### Proofpoint samples
+
+The three Proofpoint samples follow the [SIEM API](https://help.proofpoint.com/Threat_Insight_Dashboard/API_Documentation/SIEM_API)
+message and click event schemas. The SIEM API only returns messages that contained a threat, so each
+message has a `threatsInfoMap` entry: `threatID`, `threatUrl`, `threatType`, `classification`,
+`threatStatus`, `threatTime`, `threat` (the condemned URL or attachment hash), `campaignId`, `actors` and
+`detectionType`. The click sample has `threatID` and `threatURL` at the top level, as documented, plus
+`threatType: "url"`. That field isn't in the click schema, but every click threat is a URL.
+
+**Synthetic, and obviously so:** threat, campaign, message and click IDs read
+`NGSIEM-LogTester-TEST-THREAT-<random>` and so on, with a new random suffix each time a sample is loaded.
+`threatURL` and `threatUrl` follow Proofpoint's documented TAP Dashboard path
+(`.../threat/u/<threatID>`), end in the same threat ID as `threatID`, and use the reserved host
+`threatinsight.proofpoint.example`, so they point to no real detection. Sender user parts are hashed,
+as the API does. Attachment hashes are of a harmless test string.
+
+**Values the parser expects:** Proofpoint documents `threatType` as Attachment, URL or Message, and
+`classification` as Malware, Phish, Spam, Impostor or TOAD, but its own examples mix cases. The samples use
+lower case (`url`, `attachment`, `phish`, `malware`). That's what CrowdStrike's `proofpoint-tap` parser
+compares (it adds the `malware` category only for `classification = "malware"`), and what CrowdStrike's
+rule templates filter on (`threatsInfoMap.threatType="url"`). The parser copies `threatType` into
+`threat.enrichments[].indicator.type`, and the threat ID and link into `threat.indicator.id`,
+`rule.id` and `rule.reference`.
 
 ## Correlation rules
 
@@ -285,7 +309,7 @@ For each rule a third-party log could trigger, the dropdown has a generated log:
 - **Built against the real parser.** The generator works backwards from the rule's conditions through
   the parser's logic, such as "`event.reason` is copied from `Vendor.classification`" or "`event.action`
   is `clicks-permitted` when `Vendor.eventType` is `clicksPermitted`", to the raw fields the log needs.
-  It starts from the vendor's sample events (Proofpoint has a message and a click event), or from a
+  It starts from the vendor's sample events (Proofpoint has delivered, clicked and blocked events), or from a
   skeleton in the parser's format. Syslog lines are built from the parser's own extraction patterns,
   JSON strings inside fields are written as JSON text, and Windows XML is edited in place. It then
   simulates the parser and re-runs the check, trying other ways of producing a field until the rule

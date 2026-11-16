@@ -17,7 +17,7 @@ from sample_events import MARKER, SAMPLE_IDS, SAMPLES, list_samples, render_samp
 from workflow import Settings, parse_log
 
 REQUESTED_SOURCES = [
-    "Proofpoint TAP log", "Proofpoint TAP click log", "Microsoft Windows system event log", "Microsoft Entra log", "Cisco UCS log",
+    "Proofpoint TAP log", "Proofpoint TAP click log", "Proofpoint TAP blocked message log", "Microsoft Windows system event log", "Microsoft Entra log", "Cisco UCS log",
     "Cisco Firepower log", "VMware vSphere log", "AWS CloudTrail log", "AWS SecurityHub log",
     "Abnormal Security email log", "Checkpoint NGFW log", "Claroty xDome log", "Cloudflare log",
     "Epic Systems EHR log", "Fortinet firewall log", "Google Workspace log", "Netskope log", "Okta log",
@@ -129,7 +129,7 @@ def web(tmp_path):
 def test_routes_list_and_render_samples(web):
     client = web[0].test_client()
     listing = client.get("/api/sample-events").get_json()
-    assert listing["success"] and len(listing["samples"]) == 21
+    assert listing["success"] and len(listing["samples"]) == 22
     loaded = client.get("/api/sample-events/okta").get_json()
     assert loaded["success"]
     assert json.loads(loaded["log"])["eventType"] == "user.session.start"
@@ -148,3 +148,17 @@ def test_forensic_log_records_only_real_sample_ids(web, sent, recorded):
     first = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
     assert first["event"] == "submission_started"
     assert first["sample_event_id"] == recorded
+
+
+@pytest.mark.parametrize("sample_id,threat_type,classification", [
+    ("proofpoint-tap", "url", "phish"), ("proofpoint-tap-click", "url", "phish"), ("proofpoint-tap-blocked", "attachment", "malware")])
+def test_proofpoint_threats_are_synthetic_and_consistent(sample_id, threat_type, classification):
+    event = json.loads(render_sample(sample_id))
+    threat = event["threatsInfoMap"][0] if event.get("threatsInfoMap") else event
+    threat_id = threat["threatID"]
+    link = threat.get("threatUrl") or threat.get("threatURL")
+    assert threat_id.startswith("NGSIEM-LogTester-TEST-THREAT-")
+    assert link.endswith(f"/threat/u/{threat_id}") and ".example/" in link   # points to no real detection
+    assert threat["threatType"] == threat_type and threat["classification"] == classification
+    again = json.loads(render_sample(sample_id))
+    assert (again["threatsInfoMap"][0] if again.get("threatsInfoMap") else again)["threatID"] != threat_id  # fresh each load

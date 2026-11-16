@@ -10,8 +10,10 @@ Timestamps are tokens, filled with the current time whenever a sample is loaded.
                 commonly seen format.
   approximate - no usable reference could be read, so check it against a real log.
 """
+import hashlib
 import json
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timedelta, timezone
 
 MARKER = "NGSIEM-LogTester-TEST"
 
@@ -19,52 +21,89 @@ DOCUMENTED = "documented"
 PARTIAL = "partial"
 APPROXIMATE = "approximate"
 
+
+# Proofpoint SIEM API samples. Every identifier is synthetic and says so: threat IDs, campaign IDs and
+# message IDs carry the marker plus a random suffix (new each time a sample is loaded), and the TAP
+# Dashboard links follow Proofpoint's documented path on a reserved .example host, so they point to no
+# real detection. Values that CrowdStrike's parser and rule templates compare are lower case
+# (classification "phish", threatType "url"), as they expect.
+PROOFPOINT_SIEM_DOCS = "https://help.proofpoint.com/Threat_Insight_Dashboard/API_Documentation/SIEM_API"
+THREAT_DASHBOARD = f"https://threatinsight.proofpoint.example/#/{MARKER}-CUSTOMER"
+PHISH_URL = f"https://login-verify.example.com/{MARKER}/phishing-test"
+HASHED_SENDER = hashlib.md5(b"ngsiem-logtester-test-sender").hexdigest()          # the API hashes the user part
+HASHED_INVOICE_SENDER = hashlib.md5(b"ngsiem-logtester-test-invoices").hexdigest()
+SYNTHETIC_MD5 = hashlib.md5(f"{MARKER} message body".encode()).hexdigest()
+SYNTHETIC_SHA256 = hashlib.sha256(f"{MARKER} message body".encode()).hexdigest()
+ATTACHMENT_MD5 = hashlib.md5(f"{MARKER} harmless test attachment".encode()).hexdigest()
+ATTACHMENT_SHA256 = hashlib.sha256(f"{MARKER} harmless test attachment".encode()).hexdigest()
+
+
+def _threat(threat_type, classification, artifact):
+    """One threatsInfoMap entry, in the documented structure, with synthetic identifiers."""
+    return {
+        "actors": [{"id": f"{MARKER}-ACTOR-0001", "name": "ngsiem_logtester_test_actor", "type": "ACTOR"}],
+        "campaignId": f"{MARKER}-CAMPAIGN-{{{{RID}}}}",
+        "classification": classification,
+        "detectionType": "NONE",
+        "threat": artifact,
+        "threatID": f"{MARKER}-THREAT-{{{{RID}}}}",
+        "threatStatus": "active",
+        "threatTime": "{{ISO_MS}}",
+        "threatType": threat_type,
+        "threatUrl": f"{THREAT_DASHBOARD}/threat/u/{MARKER}-THREAT-{{{{RID}}}}",
+    }
+
+
 SAMPLES = [
     {
         "id": "proofpoint-tap",
         "label": "Proofpoint TAP log",
         "accuracy": DOCUMENTED,
         "parser": "proofpoint-tap",
-        "note": "One delivered message, as CrowdStrike's proofpoint-tap parser reads it: one message per event, with eventType naming the SIEM API category (messagesDelivered).",
-        "source": "https://help.proofpoint.com/Threat_Insight_Dashboard/API_Documentation/SIEM_API",
+        "note": ("One delivered message containing a phishing URL, in the SIEM API's message event schema, as "
+                 "CrowdStrike's proofpoint-tap parser reads it: one message per event, with eventType naming the "
+                 "category. The SIEM API only returns messages with a known threat, so threatsInfoMap has one. "
+                 "threatID, threatUrl and campaignId are synthetic and point to no real detection."),
+        "source": PROOFPOINT_SIEM_DOCS,
         "event": {
             "eventType": "messagesDelivered",
-            "GUID": f"{MARKER}-GUID-0001",
-            "QID": f"{MARKER}-QID",
+            "GUID": f"{MARKER}-GUID-{{{{RID}}}}",
+            "QID": f"{MARKER}-QID-{{{{RID}}}}",
             "ccAddresses": [],
-            "clusterId": "example_hosted",
+            "clusterId": "ngsiem_logtester_test_hosted",
             "completelyRewritten": "true",
             "fromAddress": ["sender@example.com"],
-            "headerFrom": "Test Sender <sender@example.com>",
+            "headerFrom": "\"Synthetic Sender\" <sender@example.com>",
             "headerReplyTo": None,
+            "headerTo": "\"Test Recipient\" <recipient@example.com>",
             "impostorScore": 0,
             "malwareScore": 0,
-            "messageID": f"<{MARKER}@example.com>",
+            "messageID": f"<{MARKER}-{{{{RID}}}}@example.com>",
             "messageParts": [
                 {
-                    "contentType": "text/plain",
+                    "contentType": "text/html",
                     "disposition": "inline",
-                    "filename": "text.txt",
-                    "md5": "00000000000000000000000000000000",
-                    "oContentType": "text/plain",
+                    "filename": "text.html",
+                    "md5": SYNTHETIC_MD5,
+                    "oContentType": "text/html",
                     "sandboxStatus": "unsupported",
-                    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "sha256": SYNTHETIC_SHA256,
                 }
             ],
-            "messageSize": 2048,
+            "messageSize": 18432,
             "messageTime": "{{ISO_MS}}",
-            "modulesRun": ["spam", "urldefense"],
-            "phishScore": 0,
+            "modulesRun": ["spam", "urldefense", "pdr", "dmarc"],
+            "phishScore": 92,
             "policyRoutes": ["default_inbound"],
             "quarantineFolder": None,
             "quarantineRule": None,
             "recipient": ["recipient@example.com"],
             "replyToAddress": [],
-            "sender": "sender@example.com",
+            "sender": f"{HASHED_SENDER}@example.com",
             "senderIP": "192.0.2.10",
-            "spamScore": 0,
-            "subject": f"{MARKER} synthetic event, not real mail",
-            "threatsInfoMap": [],
+            "spamScore": 12,
+            "subject": f"{MARKER} synthetic phishing test: verify your account",
+            "threatsInfoMap": [_threat("url", "phish", PHISH_URL)],
             "toAddresses": ["recipient@example.com"],
             "xmailer": None,
         },
@@ -74,26 +113,90 @@ SAMPLES = [
         "label": "Proofpoint TAP click log",
         "accuracy": DOCUMENTED,
         "parser": "proofpoint-tap",
-        "note": "One permitted click on a URL in a delivered message, as the SIEM API's clicksPermitted records it, with eventType naming the category.",
-        "source": "https://help.proofpoint.com/Threat_Insight_Dashboard/API_Documentation/SIEM_API",
+        "note": ("One permitted click on a phishing URL, in the SIEM API's click event schema (clicksPermitted), "
+                 "with eventType naming the category. threatID, threatURL, campaignId and id are synthetic. "
+                 "threatType isn't in the click schema; it's added as \"url\", the only kind of threat a click can be."),
+        "source": PROOFPOINT_SIEM_DOCS,
         "event": {
             "eventType": "clicksPermitted",
-            "campaignId": f"{MARKER}-CAMPAIGN",
+            "campaignId": f"{MARKER}-CAMPAIGN-{{{{RID}}}}",
             "classification": "phish",
             "clickIP": "192.0.2.25",
-            "clickTime": "{{ISO_MS}}",
-            "GUID": f"{MARKER}-GUID-0002",
-            "id": f"{MARKER}-CLICK-0001",
-            "messageID": f"<{MARKER}@example.com>",
+            "clickTime": "{{ISO_MS_1M_AGO}}",
+            "GUID": f"{MARKER}-GUID-{{{{RID}}}}",
+            "id": f"{MARKER}-CLICK-{{{{RID}}}}",
+            "messageID": f"<{MARKER}-{{{{RID}}}}@example.com>",
             "recipient": "recipient@example.com",
-            "sender": "sender@example.com",
+            "sender": f"{HASHED_SENDER}@example.com",
             "senderIP": "192.0.2.10",
-            "threatID": f"{MARKER}-THREAT-0001",
+            "threatID": f"{MARKER}-THREAT-{{{{RID}}}}",
             "threatTime": "{{ISO_MS}}",
-            "threatURL": "https://threatinsight.proofpoint.com/example/threat/email/NGSIEM-LogTester-TEST",
+            "threatType": "url",
+            "threatURL": f"{THREAT_DASHBOARD}/threat/u/{MARKER}-THREAT-{{{{RID}}}}",
             "threatStatus": "active",
-            "url": "https://www.example.com/NGSIEM-LogTester-TEST",
-            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NGSIEM-LogTester",
+            "url": PHISH_URL,
+            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36 NGSIEM-LogTester",
+        },
+    },
+    {
+        "id": "proofpoint-tap-blocked",
+        "label": "Proofpoint TAP blocked message log",
+        "accuracy": DOCUMENTED,
+        "parser": "proofpoint-tap",
+        "note": ("One message quarantined by Attachment Defense for a malicious attachment, in the SIEM API's "
+                 "message event schema (messagesBlocked). threatID, threatUrl and campaignId are synthetic; the "
+                 "attachment hashes are of a harmless test string."),
+        "source": PROOFPOINT_SIEM_DOCS,
+        "event": {
+            "eventType": "messagesBlocked",
+            "GUID": f"{MARKER}-GUID-{{{{RID}}}}",
+            "QID": f"{MARKER}-QID-{{{{RID}}}}",
+            "ccAddresses": [],
+            "clusterId": "ngsiem_logtester_test_hosted",
+            "completelyRewritten": "na",
+            "fromAddress": ["invoices@example.com"],
+            "headerFrom": "\"Synthetic Billing\" <invoices@example.com>",
+            "headerReplyTo": None,
+            "headerTo": "\"Test Recipient\" <recipient@example.com>",
+            "impostorScore": 0,
+            "malwareScore": 100,
+            "messageID": f"<{MARKER}-{{{{RID}}}}@example.com>",
+            "messageParts": [
+                {
+                    "contentType": "text/plain",
+                    "disposition": "inline",
+                    "filename": "text.txt",
+                    "md5": SYNTHETIC_MD5,
+                    "oContentType": "text/plain",
+                    "sandboxStatus": "unsupported",
+                    "sha256": SYNTHETIC_SHA256,
+                },
+                {
+                    "contentType": "application/pdf",
+                    "disposition": "attached",
+                    "filename": f"{MARKER}-invoice.pdf",
+                    "md5": ATTACHMENT_MD5,
+                    "oContentType": "application/pdf",
+                    "sandboxStatus": "threat",
+                    "sha256": ATTACHMENT_SHA256,
+                },
+            ],
+            "messageSize": 96512,
+            "messageTime": "{{ISO_MS}}",
+            "modulesRun": ["sandbox", "spam", "urldefense", "pdr"],
+            "phishScore": 18,
+            "policyRoutes": ["default_inbound"],
+            "quarantineFolder": "Attachment Defense",
+            "quarantineRule": "module.sandbox.threat",
+            "recipient": ["recipient@example.com"],
+            "replyToAddress": [],
+            "sender": f"{HASHED_INVOICE_SENDER}@example.com",
+            "senderIP": "198.51.100.77",
+            "spamScore": 4,
+            "subject": f"{MARKER} synthetic malware test: invoice attached",
+            "threatsInfoMap": [_threat("attachment", "malware", ATTACHMENT_SHA256)],
+            "toAddresses": ["recipient@example.com"],
+            "xmailer": None,
         },
     },
     {
@@ -698,6 +801,10 @@ def _tokens(now):
         "{{SYSLOG}}": now.strftime("%b %d %H:%M:%S"),
         "{{PANOS}}": now.strftime("%Y/%m/%d %H:%M:%S"),
         "{{EPOCH}}": str(int(now.timestamp())),
+        "{{ISO_MS_1M_AGO}}": (now - timedelta(minutes=1)).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        # A random suffix, new each time a sample is loaded, shared by every ID in that sample so a
+        # threatURL always ends in the same synthetic threat ID as threatID.
+        "{{RID}}": secrets.token_hex(4).upper(),
     }
 
 
