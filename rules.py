@@ -569,6 +569,9 @@ def template_entry(rule, simulation=None):
     try:
         from generator import generate
         generated = generate(rule, simulation) if simulation is not None and simulation.active else None
+        correlated = _correlate_sample(rule, simulation)
+        if correlated:
+            generated = correlated
         if generated:
             log, note, parser, simulated = generated["log"], generated["note"], generated["parser"], True
             check = generated["check"]
@@ -603,6 +606,37 @@ def template_entry(rule, simulation=None):
         "format": "text" if is_text else "json",
         "log": text,
     }
+
+
+def _correlate_sample(rule, simulation):
+    """For a correlate() rule: this source's event, built from its own sub-search.
+
+    The rule can only fire with the other sources' events too, so the verdict is at best "needs more
+    events" and the note points to the Missing data panel, which builds the companion events.
+    """
+    if simulation is None or not simulation.active or "correlate" not in (rule.get("query") or ""):
+        return None
+    from generator import generate
+    from missing import pseudo_rules
+    parsed, pseudos = pseudo_rules(rule)
+    if not parsed:
+        return None
+    for sub in parsed["subs"]:
+        generated = generate(pseudos[sub["name"]], simulation)
+        if not generated:
+            continue
+        others = [s["name"] for s in parsed["subs"] if s["name"] != sub["name"]]
+        check = dict(generated["check"])
+        if check["verdict"] == LIKELY:
+            check["verdict"] = NEEDS_EVENTS
+        check["reasons"] = [f"This rule joins events from {len(parsed['subs'])} sources ({', '.join(s['name'] for s in parsed['subs'])}). "
+                            f"This log is the {sub['name']} event; also send the {', '.join(others)} event(s), built in "
+                            "Missing data below, with the same shared value."] + list(check.get("reasons") or [])
+        note = (f"This is the {sub['name']} event. The rule also needs the {', '.join(others)} event(s), from other sources, "
+                f"{'in that order ' if parsed['sequence'] else ''}{'within ' + parsed['within'] if parsed['within'] else ''}: "
+                "use Missing data below to choose the shared value and build them. " + (generated.get("note") or ""))
+        return {**generated, "check": check, "verdict": check["verdict"], "note": note.strip()}
+    return None
 
 
 def rule_templates(rules, simulation=None, cache=None):

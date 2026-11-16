@@ -36,6 +36,14 @@
   .tip .unknown { color: var(--warn); }
   .tip .note { color: var(--muted); margin: 6px 0 0; }
   .verify { margin-top: 12px; }
+  .version { margin-top: 8px; color: var(--muted); font-size: 12px; text-align: right; }
+  .missing .item { border-top: 1px solid var(--line); padding: 10px 0; }
+  .missing .item label { margin-bottom: 4px; overflow-wrap: anywhere; }
+  .missing .item .row select, .missing .item .row input { flex: 1; min-width: 200px; font: inherit; color: inherit;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  .missing .companion { border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin-top: 10px; }
+  .missing .companion pre { max-height: 260px; overflow: auto; background: var(--code-bg); color: var(--code-text);
+    padding: 8px; border-radius: 6px; font: 12px/1.45 ui-monospace, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
   button.small { padding: 2px 10px; font-size: 13px; margin-left: 8px; }
   .suggestions > button.small { margin: 4px 0 0; }
   .suggestions li { margin: 4px 0; }
@@ -185,6 +193,16 @@
         <button id="apply-undo" type="button" class="link">Undo</button></p>
       <div id="rule-groups"></div>
     </div>
+    <div class="rulecheck missing" id="missing-panel" aria-live="polite" hidden>
+      <div class="rulecheck-head">
+        <strong>Missing data for this rule</strong>
+      </div>
+      <p class="hint" id="missing-summary"></p>
+      <div id="missing-items"></div>
+      <div class="row"><button id="missing-apply" type="button" class="primary">Apply values</button></div>
+      <p class="apply-status" id="missing-status" role="status" hidden></p>
+      <div id="missing-companions"></div>
+    </div>
     <div class="actions">
       <div>
         <label for="mode">Send as</label>
@@ -216,6 +234,7 @@
   </section>
 
   <footer class="contact" id="contact" hidden></footer>
+  <footer class="version" id="app-version">NG-SIEM Log Tester v{{ app_version }}</footer>
 </main>
 
 <dialog id="settings-dialog" aria-labelledby="settings-title">
@@ -926,6 +945,7 @@
     showSampleNote(sample);
     if (!id) {
       loadedSampleText = null;
+      loadMissing(null);
       return;
     }
     const data = await callApi(`/api/sample-events/${encodeURIComponent(id)}`);
@@ -946,7 +966,131 @@
     }
     refreshControls();
     scheduleCheck();
+    loadMissing(sample);
   }
+
+  // ---------------------------------------------------------------- missing data
+  // For a rule sample, what the rule needs that one log can't supply (other sources' events, threat
+  // intelligence, lookup files, several events), each with example values or the operator's own.
+  let missingRule = null;
+
+  function missingRequest(extra = {}) {
+    return {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ log: logInput.value, mode: $("mode").value, connector_id: selected ? selected.id : null,
+        sample_id: sampleSelect.value || null, rule_key: missingRule, ...extra }),
+    };
+  }
+
+  async function loadMissing(sample) {
+    const panel = $("missing-panel");
+    $("missing-status").hidden = true;
+    $("missing-companions").replaceChildren();
+    missingRule = sample && sample.rule_key ? sample.rule_key : null;
+    if (!missingRule) {
+      panel.hidden = true;
+      return;
+    }
+    const data = await callApi("/api/missing-data", missingRequest());
+    if (!data.success || !(data.items || []).length) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    const c = data.correlate;
+    $("missing-summary").textContent = c
+      ? `This rule joins events from ${c.sources.length} sources (${c.sources.map((s) => `${s.name}: ${s.vendor} ${s.product}`).join("; ")}). `
+        + `This log is the ${c.this_log} event. Choose the shared values, then send the companion events built below`
+        + `${c.sequence ? ", in order" : ""}${c.within ? `, within ${c.within}` : ""}.`
+      : "One generated log can't supply everything this rule needs. Choose an example value or enter your own, then apply them to the log.";
+    $("missing-items").replaceChildren(...data.items.map(missingItem));
+    $("missing-apply").hidden = !data.items.some((i) => i.kind !== "info");
+  }
+
+  function missingItem(item) {
+    const id = `missing-${item.id.replace(/[^a-z0-9]+/gi, "-")}`;
+    const parts = [el("label", { htmlFor: id, textContent: item.label }), el("p", { className: "hint", textContent: item.help })];
+    if (item.kind !== "info") {
+      const input = el("input", { id, type: "text", value: (item.examples || [])[0] || "", placeholder: "Enter a value" });
+      input.dataset.item = item.id;
+      const options = [...(item.examples || []).map((v) => new Option(v, v)), new Option("Enter my own value...", "__own__")];
+      const choose = el("select", { ariaLabel: `Example values for ${item.label}` }, options);
+      choose.onchange = () => {
+        if (choose.value === "__own__") {
+          input.value = "";
+          input.focus();
+        } else {
+          input.value = choose.value;
+        }
+      };
+      if (!(item.examples || []).length) choose.value = "__own__";
+      parts.push(el("div", { className: "row" }, [choose, input]));
+    }
+    return el("div", { className: "item" }, parts);
+  }
+
+  async function applyMissing() {
+    const values = {};
+    for (const input of $("missing-items").querySelectorAll("input[data-item]")) {
+      if (input.value.trim()) values[input.dataset.item] = input.value.trim();
+    }
+    const button = $("missing-apply");
+    button.disabled = true;
+    const data = await callApi("/api/fill-missing", missingRequest({ values }));
+    button.disabled = false;
+    const status = $("missing-status");
+    status.hidden = false;
+    status.className = `apply-status${data.success ? "" : " bad"}`;
+    status.textContent = data.message || (data.success ? "Applied." : "The values couldn't be applied.");
+    if (!data.success) return;
+    logBeforeApply = logInput.value;
+    logInput.value = data.log;
+    loadedSampleText = data.log;
+    refreshControls();
+    runCheck();
+    $("missing-companions").replaceChildren(...(data.companions || []).map(companionCard));
+  }
+
+  function companionCard(companion) {
+    const parts = [el("strong", { textContent: `Companion event: ${companion.name} (${companion.vendor} ${companion.product}, ${companion.parser} parser)` })];
+    if (!companion.log) {
+      parts.push(el("p", { className: "hint", textContent: companion.note || "No sample could be built for this source." }));
+      return el("div", { className: "companion" }, parts);
+    }
+    const connectors = companion.connectors || [];
+    parts.push(el("p", { className: "hint", textContent: (connectors.length
+      ? `Send it through a connector with the ${companion.parser} parser: ${connectors.map((c) => c.name).join(", ")}.`
+      : `Send it through a connector with the ${companion.parser} parser. None of your connectors uses it yet.`)
+      + ` Built-in check for its part of the rule: ${VERDICTS[companion.verdict] || companion.verdict}.` }));
+    parts.push(el("pre", { textContent: companion.log }));
+    const load = el("button", { type: "button", textContent: "Load into the log window" });
+    load.onclick = () => {
+      if (connectors.length && [...connectorSelect.options].some((o) => o.value === connectors[0].id)) {
+        connectorSelect.value = connectors[0].id;
+        connectorSelect.dispatchEvent(new Event("change"));
+      }
+      $("mode").value = companion.format === "text" ? "raw" : "event";
+      logInput.value = companion.log;
+      loadedSampleText = companion.log;
+      refreshControls();
+      runCheck();
+      logInput.scrollIntoView({ behavior: "smooth", block: "center" });
+    };
+    const copy = el("button", { type: "button", textContent: "Copy" });
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(companion.log);
+        copy.textContent = "Copied";
+      } catch (err) {
+        copy.textContent = "Copy failed: select the text instead";
+      }
+    };
+    parts.push(el("div", { className: "row" }, [load, copy]));
+    return el("div", { className: "companion" }, parts);
+  }
+
+  $("missing-apply").addEventListener("click", applyMissing);
 
   async function submitLog(acknowledged = []) {
     busy = true;

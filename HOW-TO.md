@@ -138,6 +138,8 @@ The table lists each condition the rule needs (**Rule wants**), the value the pa
 
 **Accepting suggestions:** next to each suggestion the app can carry out there's an **Apply** button, and **Apply all suggestions** when there are several. The app makes the change to the log for you: it finds the raw field the parser reads, for example `classification` for `event.reason`. It then re-checks and says whether the rule now matches. Click **Undo** to put the log back. Nothing is sent until you click **Clone connector and send log**. Suggestions that depend on the connector rather than the log, such as a different `#Vendor`, have no button.
 
+**Missing data:** if the rule sample can't fire from one log on its own, a **Missing data for this rule** panel appears. This happens, for example, when the rule joins events from another source, checks live threat intelligence, or counts several events. For each item, pick one of the example values or choose **Enter my own value...**, then click **Apply values**. For rules that join several sources, the panel also builds the other source's event with the same shared value. Send it through a connector with the parser it names, using **Load into the log window**, in the order and within the time the panel gives.
+
 **Information icons:**
 - **(i) next to the badge, simulated parsed event:** hover over it to see the event the connector's parser would produce from your log: tags, ECS fields and `Vendor.` fields. The app runs the parser's own logic from your tenant to work this out. Fields it can't predict, such as values from lookup files, are marked unknown.
 - **(i) next to "Can't fully check":** hover over it to see why, for example a query that correlates several events, or a field set from a lookup file.
