@@ -374,3 +374,149 @@ def test_apply_suggestion_route(tmp_path):
     assert out["success"] and json.loads(out["log"])["classification"] == "phish", out
     missing = tc.post("/api/apply-suggestion", json={**body, "rule_key": "configured:nope"})
     assert missing.status_code == 404
+
+
+# ---- timestamps, conditional evaluation, the field catalog and the audit
+
+from catalog import audit_event, catalog_parser  # noqa: E402
+from parser_sim import check_timestamp  # noqa: E402
+from timestamps import format_timestamp  # noqa: E402
+
+CLICK_PARSER = r'''
+parseJson(prefix="Vendor.", excludeEmpty=true, handleNull=discard)
+| case {
+    Vendor.messageTime=* | @timestamp := parseTimestamp("yyyy-MM-dd'T'HH:mm:ss.SSSX", field=Vendor.messageTime);
+    Vendor.threatTime=* AND Vendor.clickTime=* | parseTimestamp("yyyy-MM-dd'T'HH:mm:ss.SSSX", field=Vendor.clickTime);
+    * | parseTimestamp("yyyy-MM-dd'T'HH:mm:ss.SSSX", field=Vendor.clickTime);
+}
+| Vendor := "acme"
+| event.module := "mail"
+| destination.ip := Vendor.clickIP
+| Vendor.eventType match {
+    "clicksPermitted" => url.original := Vendor.url;
+    * => *;
+}
+'''
+
+
+@pytest.mark.parametrize("fmt", ["yyyy-MM-dd'T'HH:mm:ss.SSSX", "yyyy-MM-dd'T'HH:mm:ss[.SSSSSSSSS]XXXXX", "MMM [ ]d[d] HH:mm:ss",
+                                 "dd/MMM/yyyy:HH:mm:ss Z", "yyyy/MM/dd HH:mm:ss[.SSSSSS]", "seconds", "millis",
+                                 "EEE MMM dd HH:mm:ss[.SSSSSS] yyyy", "MMM dd yyyy HH:mm:ss z"])
+def test_formatted_timestamps_parse_with_their_own_format(fmt):
+    assert check_timestamp(format_timestamp(fmt), fmt) == (True, "")
+
+
+def test_timestamp_checks_follow_the_documented_rules():
+    iso = "yyyy-MM-dd'T'HH:mm:ss[.SSSSSSSSS]XXXXX"
+    assert check_timestamp("2018-09-08T17:51:04.777Z", iso)[0]          # default format, 3-digit fraction
+    assert check_timestamp("2018-09-08T17:51:04.777777777Z", iso)[0]    # up to 9 digits
+    assert check_timestamp("1690480444.589", "seconds")[0]              # seconds with milliseconds
+    assert not check_timestamp("2026-01-01 10:00:00", "yyyy-MM-dd'T'HH:mm:ss.SSSX")[0]
+    assert not check_timestamp(None, iso)[0]
+
+
+def test_a_bad_timestamp_adds_error_but_keeps_the_event():
+    result = simulate(CLICK_PARSER, json.dumps({"messageTime": "not a time"}), TAGS)
+    assert not result.dropped and result.fields.get("@error") == "true"
+    assert result.timestamps[0]["ok"] is False
+
+
+def test_match_guards_and_fall_through_follow_the_documentation():
+    assert simulate('parseJson() | a match { ** => b := "e"; * => b := "any" }', json.dumps({"a": "1"})).fields["b"] == "e"
+    assert simulate('parseJson() | a match { ** => b := "e"; * => b := "any" }', json.dumps({})).fields["b"] == "any"
+    assert simulate('parseJson() | a match { true => b := "t" }', json.dumps({})).fields["b"] == "t"
+    fell = simulate('parseJson() | a match { "1" => x = 2 | b := "first"; * => b := "next" }', json.dumps({"a": "1"}))
+    assert fell.fields["b"] == "next"
+
+
+def test_catalog_lists_fields_timestamps_and_conditions():
+    entry = catalog_parser({"name": "acme-mail", "version": "1", "script": CLICK_PARSER, "tag_fields": TAGS})
+    stamps = {(t["field"], t["format"]) for t in entry["timestamps"]}
+    assert ("Vendor.messageTime", "yyyy-MM-dd'T'HH:mm:ss.SSSX") in stamps
+    assert ("Vendor.clickTime", "yyyy-MM-dd'T'HH:mm:ss.SSSX") in stamps
+    assert entry["fields"]["destination.ip"][0]["raw_field"] == "clickIP"
+    assert entry["fields"]["url.original"][0]["when"] == ['Vendor.eventType is "clicksPermitted"']
+    assert "clickIP" in entry["raw_inputs"] and entry["format"] == "json"
+
+
+def test_audit_reports_missing_inputs_on_the_logs_branch():
+    doc = {"name": "acme-mail", "script": CLICK_PARSER, "tag_fields": TAGS}
+    click = {"eventType": "clicksPermitted", "clickTime": "2026-01-01T00:00:00.000Z", "threatTime": "2026-01-01T00:00:00.000Z"}
+    report = audit_event(doc, json.dumps(click), set(click))
+    missing = {m["field"]: m for m in report["missing_inputs"]}
+    assert missing["url.original"]["raw_field"] == "url" and missing["url.original"]["when"]
+    assert missing["destination.ip"]["raw_field"] == "clickIP"
+    message = {"eventType": "messagesDelivered", "messageTime": "2026-01-01T00:00:00.000Z"}
+    assert "url.original" not in {m["field"] for m in audit_event(doc, json.dumps(message), set(message))["missing_inputs"]}
+    bad = audit_event(doc, json.dumps({"eventType": "clicksPermitted"}), {"eventType"})
+    assert bad["timestamps"] and bad["timestamps"][0]["field"] == "Vendor.clickTime"
+
+
+def test_generated_samples_carry_parseable_timestamps():
+    sim = Simulation(FakeStore({"acme-mail": CLICK_PARSER}))
+    r = rule('#Vendor="acme" #event.module="mail" | url.original="https://example.com/x"')
+    entry = template_entry(r, sim)
+    log = json.loads(entry["log"])
+    result = sim.run("acme-mail", json.dumps(log))
+    assert result.timestamps and all(t["ok"] for t in result.timestamps), result.timestamps
+    assert entry["verdict"] == "likely"
+
+
+# ---- recent timestamps and timezones
+
+from timestamps import has_zone, moment_for, system_zone_label  # noqa: E402
+
+ZONE_FIELD_PARSER = r'''
+case {
+    @rawstring = /^(?<_ts>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}) (?<event.timezone>\S+) (?<host.name>\S+): (?<message>.*)/;
+}
+| parseTimestamp(format="MMM [ ]d[d] HH:mm:ss", field=_ts, timezoneField=event.timezone)
+| Vendor := "acme"
+| event.module := "wlc"
+'''
+
+
+def test_zone_rules():
+    now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    assert moment_for("yyyy-MM-dd'T'HH:mm:ssXXX", now).utcoffset() == now.astimezone().utcoffset()  # system zone, stated
+    assert moment_for("yyyy-MM-dd HH:mm:ss", now, tz="Asia/Tokyo").utcoffset() == timedelta(hours=9)
+    assert moment_for("yyyy-MM-dd HH:mm:ss", now).utcoffset() == timedelta(0)  # zone-less: NG-SIEM assumes UTC
+    assert has_zone("dd/MMM/yyyy:HH:mm:ss Z") and not has_zone("yyyy/MM/dd HH:mm:ss")
+
+
+def test_fortigate_sample_states_the_system_zone():
+    from sample_events import render_sample
+    from timestamps import offset_text
+    text = render_sample("fortinet-firewall")
+    assert f'tz="{offset_text(datetime.now().astimezone(), colon=False)}"' in text
+    local_date = datetime.now().astimezone().strftime("%Y-%m-%d")
+    assert f"date={local_date}" in text
+
+
+def test_zone_field_gets_the_system_zone():
+    sim = Simulation(FakeStore({"acme-wlc": ZONE_FIELD_PARSER}))
+    r = rule('#Vendor="acme" #event.module="wlc" | message=/link down/i')
+    entry = template_entry(r, sim)
+    assert entry["verdict"] == "likely", entry
+    assert system_zone_label() in entry["log"]
+    result = sim.run("acme-wlc", entry["log"])
+    assert all(t["ok"] for t in result.timestamps)
+
+
+def test_selected_rule_samples_have_current_timestamps(tmp_path):
+    from app import create_app
+    from app_settings import AppSettings
+    from falcon_client import FalconClient
+    from forensic_log import ForensicLog
+    import time as _t
+    client = FalconClient("id", "secret", "http://127.0.0.1:1", timeout=1)
+    sim = Simulation(FakeStore({"acme-mail": CLICK_PARSER}))
+    web = create_app(client, forensic=ForensicLog(tmp_path / "f.jsonl"), app_settings=AppSettings(tmp_path / "s.json", tmp_path / "b"),
+                     admin_password="", access_password="", allowed_hosts="", rule_refresh_minutes=0, simulation=sim)
+    r = rule('#Vendor="acme" #event.module="mail" | url.original="https://example.com/x"', source="configured")
+    web.extensions["rulebook"]._cache["configured"] = ([r], None, _t.time())
+    tc = web.test_client()
+    first = json.loads(tc.get(f"/api/sample-events/rule:{r['key']}").get_json()["log"])
+    stamp = first.get("clickTime") or first.get("messageTime")
+    parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    assert abs((datetime.now(timezone.utc) - parsed).total_seconds()) < 60

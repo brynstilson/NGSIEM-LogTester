@@ -454,7 +454,7 @@ SAMPLES = [
         "source": "https://docs.fortinet.com/document/fortigate/7.2.4/fortios-log-message-reference/949981",
         "text": (
             f"<189>date={{{{DATE}}}} time={{{{TIME}}}} devname=\"{MARKER}-FGT\" devid=\"FGT00TEST0000001\" "
-            "eventtime={{EPOCH}} tz=\"+0000\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" "
+            "eventtime={{EPOCH}} tz=\"{{TZ_OFFSET}}\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" "
             "vd=\"root\" srcip=192.0.2.100 srcport=49152 srcintf=\"port2\" srcintfrole=\"lan\" dstip=198.51.100.100 "
             "dstport=443 dstintf=\"port1\" dstintfrole=\"wan\" sessionid=1000001 proto=6 action=\"accept\" policyid=1 "
             "policytype=\"policy\" service=\"HTTPS\" dstcountry=\"Reserved\" srccountry=\"Reserved\" trandisp=\"snat\" "
@@ -682,13 +682,19 @@ SAMPLE_IDS = {sample["id"] for sample in SAMPLES}
 
 
 def _tokens(now):
+    """Timestamp tokens. Values with a zone are UTC (stated as Z or +00:00); zone-less values are UTC,
+    the zone NG-SIEM assumes; a value with a separate zone field uses the system's own timezone."""
+    from timestamps import offset_text
+    local = now.astimezone()
     return {
         "{{ISO_US_OFFSET}}": now.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00"),
         "{{ISO_US}}": now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "{{ISO_MS}}": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "{{ISO}}": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "{{DATE}}": now.strftime("%Y-%m-%d"),
-        "{{TIME}}": now.strftime("%H:%M:%S"),
+        # FortiGate states its zone in tz=, so date= and time= are local system time with the system offset.
+        "{{DATE}}": local.strftime("%Y-%m-%d"),
+        "{{TIME}}": local.strftime("%H:%M:%S"),
+        "{{TZ_OFFSET}}": offset_text(local, colon=False),
         "{{SYSLOG}}": now.strftime("%b %d %H:%M:%S"),
         "{{PANOS}}": now.strftime("%Y/%m/%d %H:%M:%S"),
         "{{EPOCH}}": str(int(now.timestamp())),

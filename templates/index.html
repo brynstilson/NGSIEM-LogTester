@@ -311,6 +311,14 @@
     const hidden = Math.max(0, ecs.length - 80) + Math.max(0, vendor.length - 60);
     const notes = [];
     if (event.dropped) notes.push("The parser would drop this log, so no event would reach NG-SIEM.");
+    // Each timestamp the parser reads, checked against its parseTimestamp() format.
+    for (const t of event.timestamps || []) {
+      if (t.ok === false) {
+        notes.push(`Timestamp problem: ${t.field} ${t.reason}. NG-SIEM would use the ingest time and add @error.`);
+      } else if (t.ok) {
+        notes.push(`Timestamp read from ${t.field} (format ${t.format}).`);
+      }
+    }
     if ((event.unsupported || []).length) notes.push(`Not simulated: ${event.unsupported.join(", ")}.`);
     if (event.error) notes.push(event.error);
     if (hidden) notes.push(`${hidden} more field${hidden === 1 ? "" : "s"} not shown.`);

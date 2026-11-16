@@ -7,3 +7,4 @@ __pycache__/
 app_settings.json
 branding/
 cache/
+reports/

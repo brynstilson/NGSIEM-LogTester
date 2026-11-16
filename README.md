@@ -77,6 +77,8 @@ apply to everyone using the installation.
 | `generator.py` | Builds a raw log that the real parser turns into an event matching a rule, checked by simulation |
 | `regex_sample.py` | Builds text that matches a regex, used for rule values and syslog lines |
 | `simulation.py` | Ties the parser store, simulator and lineage together, with caching |
+| `catalog.py` | The parser field catalog (`python catalog.py --out reports`) and the sample completeness audit |
+| `timestamps.py` | Writes the current time in a parser's own `parseTimestamp()` format |
 | `suggest.py` | Applies a rule check suggestion to the operator's log, through the parser's lineage |
 | `verify.py` | Finds a submission's events in NG-SIEM and checks the rules against NG-SIEM's own parsing |
 | `falcon_client.py` | Falcon API calls and the masked verbose log |
@@ -365,6 +367,49 @@ vCenter `Event [...]` lines and Palo Alto CSV, follow the logic of the tenant's 
 - **Coverage in practice:** in live testing against 1,628 rules, 253 needed Falcon sensor data, and
   most of the rest could only be judged "can't fully check". Treat "Unlikely" and "Can't fully check"
   as estimates, not guarantees.
+
+## Parser field catalog and timestamps
+
+`python catalog.py --out reports` reads every parser in the tenant (**NGSIEM Parsers: Read**) and writes
+`reports/parser-field-catalog.json` and `.md` (git-ignored, because they describe CrowdStrike's
+parsers). For each parser they list:
+
+- the raw format, and what a log must satisfy for the parser to keep it (a `case` with no `*` clause, or
+  a `match` with no `* => *` arm, drops anything that fits none of its clauses);
+- each timestamp it reads, with its `parseTimestamp()` format and the branch it's read on. For
+  `proofpoint-tap`: `Vendor.messageTime` for message events, `Vendor.threatTime` and
+  `Vendor.clickTime` for click events, all as `yyyy-MM-dd'T'HH:mm:ss.SSSX`;
+- the `event.dataset` and `event.action` values it sets, and under which conditions;
+- every field it produces, with each way it's produced: copied from a raw field (named), set to a
+  constant, extracted with a regex, or formatted, and the `case`/`match` conditions for each.
+
+The simulation follows CrowdStrike's documentation for conditional evaluation: `case` clauses are tried
+top to bottom until one returns the event, a `match` arm that drops the event falls through to the
+next, `*` and `true` guards match every event, and `"*"` or `**` check that a field exists.
+
+**Timestamps:** `parseTimestamp()` is checked the way NG-SIEM reads it: Java `DateTimeFormatter`
+patterns (optional `[...]` sections, fractions up to 9 digits), the default ISO 8601 format, and the
+epoch formats (`seconds`, `millis`, `unixtime` and so on). A timestamp that doesn't match leaves the
+event in place with `@error`, and NG-SIEM falls back to the ingest time. Zone-less formats are treated as
+parsed, because CrowdStrike's own parsers use them without a timezone. Generated samples are repaired
+after they're built: every timestamp the parser reads on the log's branch is written in that parser's
+own format. The simulated-event **(i)** tip shows each timestamp read, and any that wouldn't parse.
+
+**Always current:** vendor samples fill in their timestamps each time you select one, and rule samples
+are generated afresh on every selection, so every timestamp is the current time.
+
+**Timezones:** a timestamp is written in the zone that lets NG-SIEM place it exactly:
+- the parser's format includes a zone (`X`, `Z`, `z`): your system's local time with its offset, such
+  as `2026-11-16T11:43:24-07:00`;
+- the parser names a zone (`parseTimestamp(..., timezone="Asia/Tokyo")`): that zone;
+- the log has a field the parser reads the zone from (`timezoneField=`, or FortiGate's `tz=`): your
+  system's local time, with your system's timezone written in that field (`UTC-07:00`, `-0700`);
+- otherwise the format has no zone and there's nowhere to state one, so the time is written in UTC,
+  the zone NG-SIEM assumes.
+
+If a parser reads the zone from a field and the log's value isn't a valid timezone, the simulation flags
+the timestamp, and generated samples get your system's zone instead. Named zones need the `tzdata`
+package on Windows; it's in `requirements.txt`.
 
 ## Verifying a submission in NG-SIEM
 

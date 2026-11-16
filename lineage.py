@@ -84,6 +84,7 @@ class Lineage:
         self.stages = parse_script(script)
         self.producers = {}
         self.decoders = []
+        self.timestamps = []        # each parseTimestamp()/findTimestamp(): field, format, conditions
         self.raw_fields = set()     # fields read straight from the raw log by a decoder
         self._walk(self.stages, [])
         self.gates = self._gates(self.stages)
@@ -155,6 +156,8 @@ class Lineage:
 
     def _assign(self, target, expr, conds):
         kind = expr[0]
+        if kind == "callx" and expr[1][0] in ("parsetimestamp", "findtimestamp"):
+            self._call(expr[1], conds)  # x := parseTimestamp(...) reads a timestamp too
         if kind == "ref":
             self._add(Producer(target, "copy", source=_target(expr[1]), conditions=conds))
         elif kind == "lit":
@@ -219,6 +222,18 @@ class Lineage:
     def _call(self, call, conds):
         fname, positional, named = call
         first = positional[0] if positional else None
+        if fname in ("parsetimestamp", "findtimestamp"):
+            fmt = named.get("format")
+            rest = list(positional)
+            if fmt is None and rest and rest[0][0] == "lit" and "field" in named:
+                fmt = rest.pop(0)
+            field = _name(named.get("field") or (rest[0] if rest else None))
+            if field is None and fname == "findtimestamp":
+                field = "@rawstring"
+            self.timestamps.append({"function": fname, "field": _target(field) if field else None,
+                                    "format": _name(fmt) if fmt else ("(any common format)" if fname == "findtimestamp" else None),
+                                    "timezone": _name(named.get("timezone")), "conditions": conds})
+            return
         if fname in DECODERS:
             source = _name(named.get("field") or (first if first and first[0] in ("ref", "lit") else None)) or "@rawstring"
             prefix = named.get("prefix") or named.get("as")
@@ -328,13 +343,34 @@ class Lineage:
 
 
 def describe_condition(cond):
+    if cond[0] == "true":
+        return "no earlier case branch matched"
     if cond[0] == "arm":
         _, field, pattern = cond
         if pattern[0] in ("string", "word", "number"):
             return f'{field} is "{pattern[1]}"'
         if pattern[0] == "regex":
             return f"{field} matches /{pattern[1][0]}/"
+        if pattern[0] == "call":
+            values = pattern[1][2].get("values")
+            items = [str(v[1]) for v in (values[1] if values and values[0] == "list" else []) if v and v[0] == "lit"]
+            return f"{field} is one of {', '.join(items[:8])}" if items else f"{field} passes {pattern[1][0]}()"
+        if pattern[0] == "not":
+            inner = describe_condition(("arm", field, pattern[1]))
+            return f"not ({inner})" if inner else None
         return None
+    if cond[0] == "apply":
+        _, field, (fname, positional, named) = cond
+        values = named.get("values") or named.get("subnet") or (positional[0] if positional else None)
+        items = [str(v[1]) for v in (values[1] if values and values[0] == "list" else [values] if values else []) if v and v[0] == "lit"]
+        return f"{field} {fname}({', '.join(items[:8])})"
+    if cond[0] in ("and", "or"):
+        parts = [describe_condition(c) for c in cond[1]]
+        parts = [x for x in parts if x]
+        return f" {cond[0]} ".join(parts) if parts else None
+    if cond[0] == "not":
+        inner = describe_condition(cond[1])
+        return f"not ({inner})" if inner else None
     if cond[0] == "cmp":
         _, field, op, value = cond
         if value[0] == "any":
