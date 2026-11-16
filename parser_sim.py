@@ -221,7 +221,11 @@ class _Parser:
                 pattern = ("call", self.call(self.take().value))
             elif tok.kind == "op" and tok.value == "*":
                 self.take()
-                pattern = ("any",)
+                if self.is_op("*"):
+                    self.take()
+                    pattern = ("string", "*")  # ** checks that the field exists, like "*"
+                else:
+                    pattern = ("any",)
             else:
                 self.take()
                 pattern = (tok.kind, tok.value)
@@ -530,6 +534,7 @@ class Result:
     unknown: set = dc_field(default_factory=set)        # fields whose values can't be known
     unsupported: list = dc_field(default_factory=list)  # functions or syntax that weren't simulated
     uncertain: list = dc_field(default_factory=list)    # filters decided on unknown values
+    timestamps: list = dc_field(default_factory=list)   # each parseTimestamp(): field, value, format, ok, reason
     error: str = ""
     tag_fields: list = dc_field(default_factory=list)
 
@@ -545,7 +550,7 @@ class _Event:
     def __init__(self, fields, unknown=None, notes=None):
         self.fields = fields
         self.unknown = unknown if unknown is not None else set()
-        self.notes = notes if notes is not None else {"unsupported": [], "uncertain": []}
+        self.notes = notes if notes is not None else {"unsupported": [], "uncertain": [], "timestamps": []}
         self.scope = {}
 
     def copy(self):
@@ -674,6 +679,7 @@ class Simulator:
         result.unknown = set(final.unknown)
         result.unsupported = sorted(set(event.notes["unsupported"]))
         result.uncertain = sorted(set(event.notes["uncertain"]))
+        result.timestamps = list(event.notes["timestamps"])
         return result
 
     def tick(self):
@@ -733,8 +739,8 @@ class Simulator:
         value = ev.get(name)
         for pattern, body in arms:
             kind = pattern[0]
-            if kind == "any":
-                hit = True
+            if kind == "any" or (kind == "word" and str(pattern[1]).lower() == "true"):
+                hit = True  # the guards * and true match every event
             elif value is None:
                 hit = False
             elif value is UNKNOWN:
@@ -764,7 +770,10 @@ class Simulator:
             else:
                 hit = False
             if hit:
-                return self.pipeline(body, ev)
+                # Clauses are tried until one returns the event; an arm that drops it falls through.
+                out = self.pipeline(body, ev.copy())
+                if out is not None:
+                    return out
         return None
 
     # ---- filters: True, False or UNKNOWN
@@ -1206,12 +1215,166 @@ def f_parseurl(sim, ev, p, n):
     return ev
 
 
-def f_timestamp(sim, ev, p, n):
+DEFAULT_TIMESTAMP_FORMAT = "yyyy-MM-dd'T'HH:mm:ss[.SSSSSSSSS]XXXXX"
+SPECIAL_FORMATS = {"millis", "milliseconds", "nanos", "seconds", "unixtimemillis", "unixtimeseconds", "unixtime"}
+ZONE_LETTERS = set("XxZzVO")
+_format_cache = {}
+
+
+def java_format_regex(fmt):
+    """A regex for a Java DateTimeFormatter pattern, as parseTimestamp() reads it: (regex, has_zone)."""
+    if fmt in _format_cache:
+        return _format_cache[fmt]
+    out, i, has_zone, depth = [], 0, False, 0
+    while i < len(fmt):
+        c = fmt[i]
+        if c == "'":
+            j = fmt.find("'", i + 1)
+            j = len(fmt) if j < 0 else j
+            out.append(re.escape(fmt[i + 1:j] or "'"))
+            i = j + 1
+            continue
+        if c == "[":
+            out.append("(?:")
+            depth += 1
+            i += 1
+            continue
+        if c == "]":
+            out.append(")?")
+            depth = max(depth - 1, 0)
+            i += 1
+            continue
+        if c.isalpha():
+            j = i
+            while j < len(fmt) and fmt[j] == c:
+                j += 1
+            n = j - i
+            i = j
+            if c in ZONE_LETTERS:
+                has_zone = True
+            if c in "yu":
+                out.append(r"\d{2}" if n == 2 else r"\d{4}")
+            elif c in "ML":
+                out.append(r"\d{1,2}" if n <= 2 else r"[A-Za-z]{3}" if n == 3 else r"[A-Za-z]+")
+            elif c in "dHhkKms":
+                out.append(r"\d{1,2}" if n == 1 else r"\d{%d}" % n)
+            elif c == "D":
+                out.append(r"\d{1,3}")
+            elif c == "S":
+                # An optional fraction such as [.SSSSSSSSS] accepts 1 to n digits.
+                out.append(r"\d{1,%d}" % n if depth else r"\d{%d}" % n)
+            elif c == "n":
+                out.append(r"\d{1,9}")
+            elif c == "a":
+                out.append(r"[AaPp][Mm]")
+            elif c in "Ee":
+                out.append(r"[A-Za-z]{3}" if n <= 3 else r"[A-Za-z]+")
+            elif c == "X":
+                out.append(r"(?:Z|[+-]\d{2}(?::?\d{2})?)")
+            elif c == "x":
+                out.append(r"[+-]\d{2}(?::?\d{2})?")
+            elif c == "Z":
+                out.append(r"(?:Z|[+-]\d{2}:?\d{2}|GMT[+-]\d{1,2}(?::\d{2})?)")
+            elif c == "z":
+                out.append(r"[A-Za-z][A-Za-z0-9+:/_-]{1,32}")
+            elif c in "VO":
+                out.append(r"[A-Za-z][A-Za-z0-9+:/_-]*")
+            else:
+                out.append(r"\S+")
+            continue
+        out.append(re.escape(c))
+        i += 1
+    result = ("".join(out), has_zone)
+    _format_cache[fmt] = result
+    return result
+
+
+_ZONE = re.compile(r"(?:UTC|GMT|Z|[A-Z]{2,5}|[A-Za-z]+(?:/[A-Za-z0-9_+-]+)+|(?:UTC|GMT)?\s*[+-]\d{1,2}(?::?\d{2})?)")
+
+
+def valid_timezone(value):
+    """Whether a log's zone field holds something parseTimestamp() accepts as a timezone."""
+    return value is not None and _ZONE.fullmatch(str(value).strip()) is not None
+
+
+def check_timestamp(value, fmt, timezone=None, case_sensitive=True):
+    """(ok, reason) for parseTimestamp() reading value with fmt."""
+    if value is None:
+        return False, "the field is missing"
+    text = str(value).strip()
+    if fmt.lower() in SPECIAL_FORMATS:
+        ok = re.fullmatch(r"-?\d+(\.\d+)?", text) is not None
+        return ok, "" if ok else f"'{text}' isn't an epoch number ({fmt})"
+    pattern, has_zone = java_format_regex(fmt)
+    if not re.fullmatch(pattern, text, 0 if case_sensitive else re.I):
+        return False, f"'{text}' doesn't match the format {fmt}"
+    # CrowdStrike's own parsers read zone-less formats (PAN-OS, Cisco ASA) without a timezone
+    # parameter, so NG-SIEM supplies a default; such a timestamp counts as parsed.
+    return True, ""
+
+
+def _timestamp_args(sim, ev, p, n):
+    fmt_node = n.get("format")
+    positional = list(p)
+    if fmt_node is None and positional and positional[0][0] == "lit" and "field" in n:
+        fmt_node = positional.pop(0)
+    field_node = n.get("field") or (positional[0] if positional else None)
+    if fmt_node is None and len(positional) > 1 and positional[1][0] == "lit":
+        fmt_node = positional[1]
+    fmt = sim.text_arg(fmt_node, ev, DEFAULT_TIMESTAMP_FORMAT) if fmt_node is not None else DEFAULT_TIMESTAMP_FORMAT
+    field = sim.name_of(field_node, "@timestamp")
+    timezone = sim.text_arg(n.get("timezone"), ev)
+    if not timezone and n.get("timezonefield"):
+        zone = ev.get(sim.name_of(n.get("timezonefield")))
+        timezone = None if zone is UNKNOWN else zone
+    return field, fmt, timezone, sim.bool_arg(n.get("casesensitive"), True)
+
+
+def record_timestamp(sim, ev, p, n, function="parseTimestamp"):
+    """Check a timestamp as NG-SIEM would, note the outcome, and return the value to store or None."""
+    field, fmt, timezone, case_sensitive = _timestamp_args(sim, ev, p, n)
+    value = ev.get(field)
+    if value is UNKNOWN:
+        ev.notes["timestamps"].append({"field": field, "value": None, "format": fmt, "ok": None,
+                                       "reason": "the value can't be predicted", "function": function})
+        return UNKNOWN
+    if function == "findTimestamp":
+        text = str(value or "")
+        ok = bool(re.search(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}|[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}|\b1\d{9}\b", text))
+        reason = "" if ok else "no recognisable timestamp in the text"
+    else:
+        ok, reason = check_timestamp(value, fmt, timezone, case_sensitive)
+        # A zone-less format whose zone the parser reads from a field of the log: that field must
+        # hold a valid timezone, or the timestamp can't be placed in time.
+        zone_field = sim.name_of(n.get("timezonefield"))
+        if ok and zone_field and not sim.text_arg(n.get("timezone"), ev) and not java_format_regex(fmt)[1] and fmt.lower() not in SPECIAL_FORMATS:
+            zone = ev.get(zone_field)
+            if zone is not UNKNOWN and not valid_timezone(zone):
+                ok, reason = False, f"the timezone field {zone_field} doesn't hold a valid timezone ({zone!r})"
+    ev.notes["timestamps"].append({"field": field, "value": None if value is None else str(value)[:80], "format": fmt,
+                                   "ok": ok, "reason": reason, "function": function,
+                                   "timezone": sim.text_arg(n.get("timezone"), ev),
+                                   "timezone_field": sim.name_of(n.get("timezonefield"))})
+    if not ok:
+        if sim.bool_arg(n.get("adderrors"), True):
+            ev.set("@error", "true")
+            ev.set("@error_msg[0]", f"{function}: {reason}")
+        return None
+    return "(parsed timestamp)"
+
+
+def f_timestamp(sim, ev, p, n, function="parseTimestamp"):
     target = sim.name_of(n.get("as"), "@timestamp")
-    source = sim.name_of(sim.arg(p, n, "field", 1 if p and p[0][0] == "lit" and len(p) > 1 else None), "@timestamp")
-    if ev.get(source) is not None or source == "@timestamp":
-        ev.set(target, "(parsed timestamp)")
+    value = record_timestamp(sim, ev, p, n, function)
+    if value is not None:
+        ev.set(target, value)
     return ev
+
+
+def f_find_timestamp(sim, ev, p, n):
+    n = dict(n)
+    n.setdefault("field", ("ref", "@rawstring"))
+    return f_timestamp(sim, ev, p, n, "findTimestamp")
 
 
 def f_replace(sim, ev, p, n):
@@ -1721,7 +1884,7 @@ FILTER_FUNCS = {
 STAGE_FUNCS = {
     "parsejson": f_parsejson, "kvparse": f_kvparse, "parsecef": f_parsecef, "parsecsv": f_parsecsv,
     "parsexml": f_parsexml, "parseurl": f_parseurl, "parseuri": f_parseurl,
-    "parsetimestamp": f_timestamp, "findtimestamp": f_timestamp, "parsetime": f_timestamp,
+    "parsetimestamp": f_timestamp, "findtimestamp": f_find_timestamp, "parsetime": f_timestamp,
     "replace": f_replace, "lower": f_case(str.lower), "upper": f_case(str.upper),
     "lowercase": f_lowercase, "drop": f_drop, "rename": f_rename, "splitstring": f_splitstring,
     "default": f_default, "array:append": f_array_append, "array:dedup": f_array_dedup,
@@ -1736,8 +1899,9 @@ VALUE_FUNCS = {
     "replace": v_replace, "lower": v_simple(str.lower), "upper": v_simple(str.upper),
     "splitstring": v_splitstring, "concatarray": v_concatarray, "concat": v_concat, "format": v_format,
     "coalesce": v_coalesce, "getfield": v_getfield, "if": v_if,
-    "parsetimestamp": lambda sim, ev, p, n: "(parsed timestamp)",
-    "findtimestamp": lambda sim, ev, p, n: "(parsed timestamp)",
+    "parsetimestamp": lambda sim, ev, p, n: record_timestamp(sim, ev, p, n),
+    "findtimestamp": lambda sim, ev, p, n: record_timestamp(
+        sim, ev, p, {**n, "field": n.get("field", ("ref", "@rawstring"))}, "findTimestamp"),
     "rename": lambda sim, ev, p, n: sim.value(sim.arg(p, n, "field", 0), ev),
     "length": v_simple(lambda s: str(len(s))), "text:length": v_simple(lambda s: str(len(s))),
     "crypto:sha256": v_simple(lambda s: hashlib.sha256(s.encode()).hexdigest()),

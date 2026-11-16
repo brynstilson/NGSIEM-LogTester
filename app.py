@@ -88,6 +88,12 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
     template_cache = {}
     submissions = OrderedDict()  # submission ID -> what's needed to verify it later
 
+    def fresh_entry(rule):
+        """A newly generated sample for one rule, with timestamps for right now."""
+        entry = template_entry(rule, simulation)
+        template_cache[(rule["key"], rule["query"], rule["enabled"])] = entry
+        return entry
+
     def entry_for(rule):
         """The generated sample for one rule, built once per rule version."""
         key = (rule["key"], rule["query"], rule["enabled"])
@@ -235,6 +241,7 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
             tags = {f"#{t}": result.fields[t] for t in result.tag_fields if t in result.fields}
             events.append({"dropped": result.dropped, "tags": tags, "fields": dict(list(fields.items())[:400]),
                            "unknown": sorted(result.unknown), "unsupported": result.unsupported,
+                           "timestamps": result.timestamps,
                            "error": result.error, "approximate": result.approximate})
         return {"available": True, "parser": doc["name"], "version": doc["version"], "events": events}
 
@@ -428,7 +435,9 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
     def sample_event(sample_id):
         if sample_id.startswith("rule:"):
             rule = rulebook.find(sample_id[len("rule:"):])
-            entry = entry_for(rule) if rule else None
+            # Built afresh on every selection, so its timestamps are current (the cached copy only feeds
+            # the dropdown's labels).
+            entry = fresh_entry(rule) if rule else None
             if entry is None:
                 return jsonify(success=False, message=f"Unknown rule template: {sample_id}"), 404
             return jsonify(success=True, log=entry["log"], note=entry["note"], verdict=entry["verdict"],

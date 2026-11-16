@@ -377,7 +377,23 @@ def _apply_xml(text, edits):
         leaf = parts[-1]
         value = escape(str(value))
         if leaf.startswith("_"):
-            continue  # attributes are left as they are
+            # An attribute, such as Event.System.TimeCreated._SystemTime: set it on its element.
+            if len(parts) < 2:
+                continue
+            element, attribute = parts[-2], leaf[1:]
+            tag = _re.compile(r"<" + _re.escape(element) + r"(\s[^>]*?)?(/?)>")
+            match = tag.search(text)
+            if match:
+                attrs = match.group(1) or ""
+                attr = _re.compile(r"(\s" + _re.escape(attribute) + r"=)([\"'])([^\"']*)[\"']")
+                if attr.search(attrs):
+                    attrs = attr.sub(lambda m: f"{m.group(1)}{m.group(2)}{value}{m.group(2)}", attrs, count=1)
+                else:
+                    attrs = f"{attrs} {attribute}='{value}'"
+                text = text[:match.start()] + f"<{element}{attrs}{match.group(2)}>" + text[match.end():]
+            elif len(parts) >= 3 and f"</{parts[-3]}>" in text:
+                text = text.replace(f"</{parts[-3]}>", f"<{element} {attribute}='{value}'/></{parts[-3]}>", 1)
+            continue
         if len(parts) >= 2 and parts[-2] == "EventData":
             data = _re.compile(r"(<Data\s+Name=[\"']" + _re.escape(leaf) + r"[\"']\s*>)(.*?)(</Data>)", _re.S)
             if data.search(text):
@@ -497,6 +513,12 @@ def generate(rule_info, simulation):
             if check["verdict"] != LIKELY:
                 solver, check, unplaced = _search(rule_info, parser, lineage, solver, reqs, simulation, build, check, unplaced)
                 log, events, text_log = build(solver)
+            # Every timestamp the parser reads on this log's branch must be present and in its format.
+            repaired = repair_timestamps(solver, parser, lineage, simulation, build)
+            if repaired is not None:
+                solver = repaired
+                log, events, text_log = build(solver)
+                check = judge(rule_info, events_of(text_log, "raw" if isinstance(log, str) else "event"), parser, simulation)
             sim_result = simulation.run(parser, events[0] if isinstance(events[0], str) else json.dumps(events[0]))
             dropped = bool(sim_result and sim_result.dropped)
             score = (RANK.get(check["verdict"], 4) + (5 if dropped else 0), parsers.index(parser), len(unplaced), label == "skeleton")
@@ -666,3 +688,54 @@ def _search(rule_info, parser, lineage, solver, reqs, simulation, build, check, 
         if not improved:
             break
     return solver, check, unplaced
+
+
+
+def repair_timestamps(solver, parser, lineage, simulation, build, rounds=3):
+    """A solver whose log carries every timestamp the parser reads, written in the parser's own format,
+    or None if nothing needed fixing. Placeholders and missing timestamp fields are replaced."""
+    from timestamps import format_timestamp, has_zone, system_zone_label
+    changed = False
+    for _ in range(rounds):
+        log, events, _ = build(solver)
+        first = events[0]
+        result = simulation.run(parser, first if isinstance(first, str) else json.dumps(first))
+        if result is None:
+            break
+        bad = [t for t in result.timestamps if t.get("ok") is False and t.get("field")]
+        if not bad:
+            break
+        progress = False
+        for t in bad:
+            field = t["field"][1:] if t["field"].startswith("#") else t["field"]
+            trial = copy.copy(solver)
+            trial.edits, trial.raw_overrides, trial.raw_text = solver.snapshot()
+            # A zone-less format whose zone the parser reads from another field: write the system's
+            # local time, and put the system's timezone in that field.
+            zone_field = t.get("timezone_field")
+            zone_written = False
+            if zone_field and not has_zone(t["format"]) and not t.get("timezone"):
+                zone_written = _set_raw(trial, lineage, zone_field, system_zone_label())
+            value = format_timestamp(t["format"], tz=t.get("timezone"), zone_field=zone_written)
+            if not _set_raw(trial, lineage, field, value):
+                continue
+            solver, progress, changed = trial, True, True
+        if not progress:
+            break
+    return solver if changed else None
+
+
+
+def _set_raw(solver, lineage, field, value):
+    """Put value where the parser reads field from: a raw field, or a group of the regex that takes
+    the raw line apart. False if neither is known."""
+    path = solver.raw_path(field) or (lineage.raw_source(field) if lineage else None)
+    if path:
+        solver.edits[path] = value
+        return True
+    extract = [p for p in (lineage.producers.get(field, []) if lineage else []) if p.kind == "extract" and p.source == "@rawstring"]
+    key = next((p.value for p in extract if p.value in solver.raw_overrides), extract[0].value if extract else None)
+    if key is None:
+        return False
+    solver.raw_overrides.setdefault(key, {})[field] = value
+    return True
