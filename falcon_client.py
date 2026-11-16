@@ -301,6 +301,19 @@ class FalconClient:
             raise FalconError(f"Parser {parser_id} has no definition.")
         return resource
 
+    def search_indicators(self, indicator_type, confidences, log, limit=3):
+        """Recent Falcon Intelligence indicators of one type, such as ip_address, at the given malicious
+        confidences ("high", "medium"...). Needs the Indicators (Falcon Intelligence): Read scope."""
+        quoted = ",".join(f"'{c}'" for c in confidences)
+        response = self.request("GET", "/intel/combined/indicators/v1", log, params={
+            "filter": f"type:'{indicator_type}'+malicious_confidence:[{quoted}]",
+            "limit": limit, "sort": "published_date|desc"})
+        if response.status_code == 403:
+            raise FalconError("Listing indicators needs the Indicators (Falcon Intelligence): Read scope.")
+        if not response.ok:
+            raise FalconError(f"Could not list Falcon Intelligence indicators: {api_errors(response)}")
+        return [r for r in (response.json().get("resources") or []) if isinstance(r, dict) and r.get("indicator")]
+
     def start_search(self, repository, query, start, log, end="now"):
         """Start an NG-SIEM search job and return its ID. Needs the NGSIEM: Write scope."""
         response = self.request("POST", f"/humio/api/v1/repositories/{repository}/queryjobs", log,

@@ -1,5 +1,6 @@
 """Parser simulation, lineage, regex samples, generation, rule refresh and verification."""
 import json
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -520,3 +521,94 @@ def test_selected_rule_samples_have_current_timestamps(tmp_path):
     stamp = first.get("clickTime") or first.get("messageTime")
     parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     assert abs((datetime.now(timezone.utc) - parsed).total_seconds()) < 60
+
+
+# ---- missing data and the build version
+
+import missing  # noqa: E402
+
+CORRELATE_RULE = '''#repo!="xdr*"
+| correlate(
+  Mail: {
+    #Vendor="acme" #event.module="mail"
+    | objectArray:exists(array="Vendor.threatsInfoMap[]", condition={Vendor.threatsInfoMap.classification="phish"})
+    | split(Vendor.threatsInfoMap)
+  } include:[Vendor.threatsInfoMap.threat],
+  Box: {
+    #Vendor="acme" #event.module="box"
+    | message=/download/i
+    | message <=> Mail.Vendor.threatsInfoMap.threat
+  } include:[message],
+  sequence=true,
+  within=30m  // TUNING
+)'''
+
+MAIL_PARSER = r'''
+parseJson(prefix="Vendor.", excludeEmpty=true, handleNull=discard)
+| Vendor := "acme"
+| event.module := "mail"
+'''
+
+
+def test_correlate_is_split_into_its_sources():
+    parsed = missing.parse_correlate(CORRELATE_RULE)
+    assert [s["name"] for s in parsed["subs"]] == ["Mail", "Box"]
+    assert parsed["sequence"] and parsed["within"] == "30m"
+    assert parsed["joins"] == [{"sub": "Box", "field": "message", "other": "Mail", "other_field": "Vendor.threatsInfoMap.threat"}]
+    query, splits = missing.sub_query(parsed, "Mail")
+    assert 'Vendor.threatsInfoMap[0].classification="phish"' in query and "split" not in query and "<=>" not in query
+
+
+def test_missing_data_builds_a_companion_with_the_shared_value():
+    sim = Simulation(FakeStore({"acme-mail": MAIL_PARSER, "acme-box": SYSLOG_PARSER.replace('"box"', '"box"')}))
+    r = rule(CORRELATE_RULE)
+    entry = template_entry(r, sim)
+    assert entry["verdict"] == "needs_more_events" and "Box" in entry["note"]
+    analysis = missing.analyze(r, entry["log"], "event", entry["parser"], sim)
+    join = next(i for i in analysis["items"] if i["kind"] == "join")
+    assert join["field"] == "Vendor.threatsInfoMap[0].threat" and len(join["examples"]) == 3
+    chosen = join["examples"][1]
+    out = missing.fill(r, entry["log"], "event", entry["parser"], sim, {join["id"]: chosen})
+    assert json.loads(out["log"])["threatsInfoMap"][0]["threat"] == chosen
+    companion = out["companions"][0]
+    assert companion["name"] == "Box" and chosen in companion["log"] and "order" in out["message"]
+
+
+def test_ioc_and_lookup_and_threshold_items():
+    class Intel:
+        def search_indicators(self, ioc_type, confidences, log, limit=3):
+            assert ioc_type == "ip_address" and confidences == ["high"]
+            return [{"indicator": "203.0.113.200"}, {"indicator": "203.0.113.201"}]
+    sim = Simulation(FakeStore({"acme-mail": JSON_PARSER}))
+    r = rule('#Vendor="acme" | ioc:lookup(source.ip, type="ip_address", confidenceThreshold="high", strict="true")'
+             ' | match(file="blocklist.csv", field=[user.name], strict=true)'
+             ' | groupBy([source.ip], function=[count(as=hits), sum(Vendor.bytes, as=total)]) | hits >= 5 | total > 1000')
+    analysis = missing.analyze(r, json.dumps({"senderIP": "192.0.2.1"}), "event", "acme-mail", sim, Intel())
+    kinds = {i["kind"]: i for i in analysis["items"]}
+    assert kinds["ioc"]["examples"] == ["203.0.113.200", "203.0.113.201"]
+    assert kinds["lookup"]["file"] == "blocklist.csv" and kinds["lookup"]["examples"] == []
+    assert kinds["events"]["examples"][0] == "5" and kinds["sum"]["examples"][0] == "1001"
+    out = missing.fill(r, json.dumps({"senderIP": "192.0.2.1", "bytes": 1}), "event", "acme-mail", sim,
+                       {kinds["ioc"]["id"]: "203.0.113.200", kinds["events"]["id"]: "5", kinds["sum"]["id"]: "1001"})
+    events = json.loads(out["log"])
+    assert len(events) == 5 and all(e["senderIP"] == "203.0.113.200" for e in events)
+    assert sum(int(e["bytes"]) for e in events) >= 1001
+
+
+def test_examples_follow_the_field():
+    assert missing.examples_for("source.ip")[0].startswith(("192.0.2.", "198.51.100.", "203.0.113."))
+    assert missing.examples_for("Vendor.properties.FileOriginUrl")[0].startswith("https://")
+    assert missing.examples_for("process.name", ("regex", (r"(cmd|powershell)\.exe", ""))) == ["cmd.exe", "powershell.exe"]
+
+
+def test_version_is_in_the_footer(tmp_path):
+    from app import APP_VERSION, create_app
+    from app_settings import AppSettings
+    from falcon_client import FalconClient
+    from forensic_log import ForensicLog
+    assert re.fullmatch(r"\d+\.\d+\.\d+", APP_VERSION)
+    assert APP_VERSION == (Path(__file__).resolve().parent.parent / "VERSION").read_text(encoding="utf-8").strip()
+    web = create_app(FalconClient("id", "s", "http://127.0.0.1:1", timeout=1), forensic=ForensicLog(tmp_path / "f.jsonl"),
+                     app_settings=AppSettings(tmp_path / "s.json", tmp_path / "b"), admin_password="", access_password="",
+                     allowed_hosts="", rule_refresh_minutes=0, simulation=Simulation(None))
+    assert f"NG-SIEM Log Tester v{APP_VERSION}" in web.test_client().get("/").get_data(as_text=True)

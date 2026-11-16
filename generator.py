@@ -450,7 +450,7 @@ def _apply(base, edits, fmt, overrides=None, skeleton=False, raw_text=()):
         for inner, value in inner_edits.items():
             try:
                 _set_path(holder, inner, value)
-            except (TypeError, AttributeError, IndexError, ValueError):
+            except (TypeError, AttributeError, IndexError, KeyError, ValueError):
                 pass
         edits[outer] = json.dumps(holder)
     if isinstance(base, dict):
@@ -458,7 +458,7 @@ def _apply(base, edits, fmt, overrides=None, skeleton=False, raw_text=()):
         for path, value in edits.items():
             try:
                 _set_path(event, path, value)
-            except (TypeError, AttributeError, IndexError, ValueError):
+            except (TypeError, AttributeError, IndexError, KeyError, ValueError):
                 pass
         return event
     if isinstance(base, str) and fmt in ("kv", "cef") and edits:

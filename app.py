@@ -6,6 +6,7 @@ import secrets
 import threading
 import time
 import uuid
+from pathlib import Path
 from collections import OrderedDict
 from datetime import datetime, timezone
 
@@ -22,6 +23,7 @@ from field_model import PROFILES
 from parsers import ParserStore
 from rules import RuleBook, evaluate, events_of, group, judge, raw_of, refresh_minutes_from, rule_templates, template_entry
 from simulation import Simulation
+from missing import analyze as analyze_missing, fill as fill_missing
 from suggest import apply_suggestion
 from verify import verify
 from sample_events import SAMPLE_IDS, list_samples, render_sample
@@ -42,12 +44,24 @@ def _summary(connection):
 
 
 MAX_CONNECTOR_ID = 200
+
+
+def read_version():
+    """The build version from the VERSION file in the repository (MAJOR.MINOR.PATCH)."""
+    try:
+        return (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+APP_VERSION = read_version()
 SUBMIT_RULES_MAX_AGE = 60        # seconds: configured rules older than this are re-read at submit
 FALCON_REQUESTS_PER_MINUTE = 30   # per client address, for the routes that call the Falcon API
 CONNECTOR_LIST_MIN_AGE = 30       # seconds before an unknown connector ID may trigger a new listing
 
 # Routes that call the Falcon API. /api/evaluate isn't here: it only uses cached rules and connectors.
-FALCON_ROUTES = {"list_connectors", "select_connector", "list_rules", "list_rule_templates", "submit", "verify_submission"}
+FALCON_ROUTES = {"list_connectors", "select_connector", "list_rules", "list_rule_templates", "submit", "verify_submission",
+                 "missing_data"}
 RECENT_SUBMISSIONS = 50  # kept in memory so they can be verified in NG-SIEM afterwards
 
 
@@ -118,6 +132,8 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
         ids = {c.get("id") for c in connections if c.get("id")}
         with known_lock:
             known["ids"], known["listed_at"] = ids, clock()
+            known["connectors"] = [{"id": c.get("id"), "name": c.get("name"), "parser": c.get("parser_name")}
+                                   for c in connections if c.get("id")]
             for stale in [cid for cid in selected if cid not in ids]:
                 selected.pop(stale, None)
 
@@ -252,7 +268,7 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
     def index():
         # The saved title goes in the first paint, so the default never flashes up.
         return render_template("index.html", title=app_settings.read()["title"], csp_nonce=g.csp_nonce,
-                               rule_refresh_minutes=rulebook.refresh_minutes)
+                               rule_refresh_minutes=rulebook.refresh_minutes, app_version=APP_VERSION)
 
     @app.get("/api/rules/status")
     def rules_status():
@@ -407,6 +423,57 @@ def create_app(client=None, settings=None, forensic=None, app_settings=None, adm
             will_fire=group(checked["will_fire"]),
             simulation=simulation_summary(text, data.get("mode", MODE_EVENT), checked.get("parser")),
         )
+
+    def _missing_request():
+        data = request.get_json(silent=True)
+        if not request.is_json or not isinstance(data, dict):
+            return None, None, (jsonify(success=False, message="Expected a JSON request."), 415)
+        rule_key = data.get("rule_key")
+        rule = rulebook.find(rule_key) if isinstance(rule_key, str) else None
+        if rule is None:
+            return None, None, (jsonify(success=False, message="That rule isn't loaded. Reload rules and try again."), 404)
+        return data, rule, None
+
+    def _parser_for_request(data, rule, log):
+        return (parser_for(data.get("connector_id"), log) or sample_parser(data.get("sample_id"))
+                or (entry_for(rule) or {}).get("parser") or rule.get("parser"))
+
+    @app.post("/api/missing-data")
+    def missing_data():
+        """What a rule needs that this log can't supply, with example values. Reads only."""
+        data, rule, refusal = _missing_request()
+        if refusal:
+            return refusal
+        log = ActivityLog()
+        text = data.get("log") if isinstance(data.get("log"), str) else ""
+        mode = data.get("mode") if data.get("mode") in (MODE_EVENT, MODE_RAW) else MODE_EVENT
+        try:
+            result = analyze_missing(rule, text, mode, _parser_for_request(data, rule, log), simulation, client, log)
+        except Exception as exc:  # The panel is optional; it must never break the page.
+            return jsonify(success=False, message=f"Couldn't work out the missing data ({type(exc).__name__}).")
+        return jsonify(success=True, **result)
+
+    @app.post("/api/fill-missing")
+    def fill_missing_route():
+        """Apply the operator's values to the log and build companion events. Nothing is sent."""
+        data, rule, refusal = _missing_request()
+        if refusal:
+            return refusal
+        log = ActivityLog()
+        text = data.get("log") if isinstance(data.get("log"), str) else ""
+        mode = data.get("mode") if data.get("mode") in (MODE_EVENT, MODE_RAW) else MODE_EVENT
+        values = data.get("values") if isinstance(data.get("values"), dict) else {}
+        values = {str(k): str(v)[:2000] for k, v in values.items() if isinstance(v, (str, int, float))}
+        try:
+            result = fill_missing(rule, text, mode, _parser_for_request(data, rule, log), simulation, values)
+        except Exception as exc:
+            return jsonify(success=False, message=f"The values couldn't be applied ({type(exc).__name__}).")
+        # Suggest the operator's connectors that use each companion event's parser.
+        for companion in result.get("companions") or []:
+            parser = str(companion.get("parser") or "")
+            companion["connectors"] = [c for c in known.get("connectors", [])
+                                       if parser and str(c.get("parser") or "").startswith(parser)][:5]
+        return jsonify(**result)
 
     @app.post("/api/apply-suggestion")
     def apply_suggestion_route():

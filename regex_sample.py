@@ -20,10 +20,11 @@ MAX_LEN = 4000
 
 
 class _Builder:
-    def __init__(self, overrides, names):
+    def __init__(self, overrides, names, branch=0):
         self.overrides = overrides        # field name -> text
         self.names = names                # python group alias -> field name
         self.groups = {}
+        self.branch = branch              # which alternative of each a|b|c to take
 
     def build(self, parsed):
         return "".join(self.node(op, av) for op, av in parsed)
@@ -39,7 +40,8 @@ class _Builder:
         if name == "IN":
             return self.pick(av)
         if name == "BRANCH":
-            return self.build(av[1][0])
+            options = av[1]
+            return self.build(options[min(self.branch, len(options) - 1)])
         if name == "SUBPATTERN":
             group, _, _, sub = av
             alias = next((a for a, i in self.group_ids.items() if i == group), None) if group else None
@@ -168,7 +170,22 @@ def sample(pattern, flags="", overrides=None):
     return _sample(chosen, pattern, flags) or _sample(overrides, pattern, flags)
 
 
-def _sample(overrides, pattern, flags):
+def variants(pattern, flags="", count=3):
+    """Up to count different strings that match the pattern, taking different alternatives (a|b|c)."""
+    out = []
+    for branch in range(8):
+        text = _sample({}, pattern, flags, branch)
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= count:
+            break
+    first = sample(pattern, flags)
+    if first and first not in out:
+        out.insert(0, first)
+    return out[:count]
+
+
+def _sample(overrides, pattern, flags, branch=0):
     compiled, names = compile_regex(pattern, flags)
     if compiled is None:
         return None
@@ -177,7 +194,7 @@ def _sample(overrides, pattern, flags):
         parsed = sre.parse(py_pattern, re.I if "i" in flags else 0)
     except Exception:
         return None
-    builder = _Builder(overrides, names)
+    builder = _Builder(overrides, names, branch)
     builder.group_ids = dict(parsed.state.groupdict)
     try:
         text = builder.build(parsed)

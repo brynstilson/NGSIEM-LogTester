@@ -15,6 +15,7 @@ client secret, and the app needs both. Give it these scopes:
 | Correlation Rules | Read | Reading configured rules and CrowdStrike's rule templates |
 | NGSIEM Parsers | Read | Reading parser definitions, so the app can simulate each connector's parser |
 | NGSIEM | Write | Verifying a submission: starting a search in NG-SIEM. Searches only read data |
+| Indicators (Falcon Intelligence) | Read | Optional: listing real indicators for rules that use `ioc:lookup()` |
 
 Correlation Rules Write isn't needed. Without the Correlation Rules scope, the app still sends logs,
 but it can't check them against rules. Without NGSIEM Parsers: Read, the rule check falls back to
@@ -61,6 +62,13 @@ apply to everyone using the installation.
 - **Audit trail:** each change is recorded in the forensic log as `settings_changed`. Logos are
   recorded by size and SHA-256, not stored in the log.
 
+## Version
+
+The build version is in the `VERSION` file and shown in the page footer, such as
+"NG-SIEM Log Tester v2.2.0". It follows semantic versioning (MAJOR.MINOR.PATCH), and every change raises
+it: see [CHANGELOG.md](CHANGELOG.md) for what each version changed and how versions are chosen. Releases
+are tagged `vX.Y.Z` in GitHub.
+
 ## Code layout
 
 | File | Purpose |
@@ -79,6 +87,7 @@ apply to everyone using the installation.
 | `simulation.py` | Ties the parser store, simulator and lineage together, with caching |
 | `catalog.py` | The parser field catalog (`python catalog.py --out reports`) and the sample completeness audit |
 | `timestamps.py` | Writes the current time in a parser's own `parseTimestamp()` format |
+| `missing.py` | The Missing data panel: what a rule needs that one log can't supply, and companion events |
 | `suggest.py` | Applies a rule check suggestion to the operator's log, through the parser's lineage |
 | `verify.py` | Finds a submission's events in NG-SIEM and checks the rules against NG-SIEM's own parsing |
 | `falcon_client.py` | Falcon API calls and the masked verbose log |
@@ -434,6 +443,30 @@ are generated afresh on every selection, so every timestamp is the current time.
 If a parser reads the zone from a field and the log's value isn't a valid timezone, the simulation flags
 the timestamp, and generated samples get your system's zone instead. Named zones need the `tzdata`
 package on Windows; it's in `requirements.txt`.
+
+## Missing data for rules one log can't fire
+
+When you choose a rule sample that one generated log can't trigger, a **Missing data for this rule** panel
+appears under the rule check. Each item has a dropdown of example values (2 or 3 where the app can offer
+them) and a box for your own value. **Apply values** writes them into the log and re-runs the check.
+
+| What the rule needs | What you choose | Examples offered |
+| --- | --- | --- |
+| `correlate()`: events from several sources joined on a shared value, such as a Proofpoint phishing URL that later appears as a Defender XDR `FileOriginUrl` | The shared value | Synthetic values that suit the field: URLs, IPs, users, hosts, files, hashes |
+| `ioc:lookup()`: an indicator in CrowdStrike's live threat intelligence | An indicator | Up to 3 real indicators from your Falcon Intelligence, of the type and confidence the rule asks for (needs Indicators: Read). Synthetic values can never match live intelligence |
+| `match(file=...)`: a value listed in one of your lookup files | A value from that file | None: enter one from the file |
+| An aggregation threshold, such as `count(as=hits) \| hits >= 5` or a `sum()` | The number of events, or the total | Values at and above the threshold |
+| Any other condition the log doesn't meet | The field's value | Synthetic values that meet the condition, such as the alternatives of a regex |
+
+**correlate() rules** get a sample for the source you're testing, built from that source's part of the
+rule and labelled "Needs more events". When you apply the shared value, the app writes it into this
+log and builds a **companion event** for each other source, through that source's parser. It also fills
+the fields the rule reports for that source (its `include:` list) with synthetic values. Each companion
+names the parser it needs and your connectors that use it. **Load into the log window** switches to that
+connector and loads the event. Send the events in the order the panel gives, within the rule's time window.
+
+Rules that use `defineTable()` or `selfJoinFilter()` depend on events already in NG-SIEM, so the panel
+says so but offers no value.
 
 ## Verifying a submission in NG-SIEM
 
